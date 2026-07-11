@@ -57,6 +57,8 @@ class Runner:
         )
         if extra_env:
             self.env.update(extra_env)
+        # fzf kills superseded previews; prevent a killed Git read from leaving index.lock.
+        self.env["GIT_OPTIONAL_LOCKS"] = "0"
 
     def run(
         self,

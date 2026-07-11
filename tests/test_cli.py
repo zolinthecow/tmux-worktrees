@@ -7,6 +7,7 @@ from unittest import mock
 
 from tests.test_model import TemporaryRepository
 from tmux_worktrees.cli import main
+from tmux_worktrees.process import Runner
 
 
 class CliTests(unittest.TestCase):
@@ -27,6 +28,13 @@ class CliTests(unittest.TestCase):
     def test_launcher_is_executable(self):
         launcher = Path(__file__).resolve().parents[1] / "tmux-worktrees"
         self.assertTrue(os.access(launcher, os.X_OK))
+
+    def test_git_optional_locks_are_always_disabled(self):
+        runner = Runner({"GIT_OPTIONAL_LOCKS": "1"})
+
+        self.assertEqual("0", runner.env["GIT_OPTIONAL_LOCKS"])
+        result = runner.run(["env"])
+        self.assertIn("GIT_OPTIONAL_LOCKS=0", result.stdout.splitlines())
 
 
 if __name__ == "__main__":
