@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import unittest
 import uuid
@@ -8,7 +9,13 @@ import uuid
 from tests.test_model import FakeGraphiteRunner, TemporaryRepository, git
 from tmux_worktrees.model import ParentSource, Repository
 from tmux_worktrees.tmux import TmuxManager
-from tmux_worktrees.ui import Picker, VirtualBranchNode, render_hierarchy
+from tmux_worktrees.ui import (
+    Picker,
+    VirtualBranchNode,
+    doctor,
+    hierarchy_as_json,
+    render_hierarchy,
+)
 
 
 class VirtualBranchTests(unittest.TestCase):
@@ -48,7 +55,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
         repo = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
         displays = [display for display, _ in rows]
         parent_index = next(index for index, value in enumerate(displays) if "parent  [G branch]" in value)
         child_index = next(index for index, value in enumerate(displays) if "child  [G]" in value)
@@ -59,6 +66,97 @@ class VirtualBranchTests(unittest.TestCase):
         parent_node = rows[parent_index][1]
         self.assertIsInstance(parent_node, VirtualBranchNode)
         self.assertEqual("main", parent_node.direct_parent)
+        recovery_json = json.loads(
+            hierarchy_as_json(repo, repo.hierarchy(), include_inactive=True)
+        )
+        parent_json_index = next(
+            index
+            for index, item in enumerate(recovery_json)
+            if item["id"] == "branch:parent"
+        )
+        child_json_index = next(
+            index
+            for index, item in enumerate(recovery_json)
+            if item["branch"] == "child"
+        )
+        self.assertLess(parent_json_index, child_json_index)
+        self.assertEqual(
+            "branch:parent", recovery_json[child_json_index]["visible_parent_id"]
+        )
+
+    def test_default_render_only_includes_active_managed_worktrees(self):
+        git(self.repository.root, "branch", "inactive", "main")
+        git(
+            self.repository.root,
+            "config",
+            "branch.inactive.tmux-worktrees-parent",
+            "main",
+        )
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy())
+
+        self.assertFalse(any("inactive" in display for display, _ in rows))
+        self.assertEqual(1, len(rows))
+
+    def test_default_render_hides_missing_registered_worktree(self):
+        repo = Repository.discover(self.repository.root)
+        worktree = repo.add_worktree("missing", "main")
+        shutil.rmtree(worktree.path)
+        repo = Repository.discover(self.repository.root)
+
+        active_rows = render_hierarchy(repo, repo.hierarchy())
+        recovery_rows = render_hierarchy(
+            repo, repo.hierarchy(), include_inactive=True
+        )
+
+        self.assertFalse(any("missing" in display for display, _ in active_rows))
+        self.assertTrue(any("missing" in display for display, _ in recovery_rows))
+
+        active_json = json.loads(hierarchy_as_json(repo, repo.hierarchy()))
+        recovery_json = json.loads(
+            hierarchy_as_json(repo, repo.hierarchy(), include_inactive=True)
+        )
+        self.assertFalse(any(item["branch"] == "missing" for item in active_json))
+        self.assertTrue(any(item["branch"] == "missing" for item in recovery_json))
+
+    def test_nearest_active_parent_skips_missing_registration(self):
+        repo = Repository.discover(self.repository.root)
+        parent = repo.add_worktree("parent", "main")
+        repo = Repository.discover(self.repository.root)
+        child = repo.add_worktree("child", "parent")
+        shutil.rmtree(parent.path)
+        repo = Repository.discover(self.repository.root)
+        node = repo.hierarchy().nodes[child.id]
+
+        selected_parent = Picker(repo)._nearest_active_parent(repo.hierarchy(), node)
+
+        self.assertEqual(repo.root_worktree.id, selected_parent.id)
+
+    def test_detached_worktree_cannot_be_deactivated(self):
+        path = self.repository.root / ".worktrees" / "detached"
+        git(self.repository.root, "worktree", "add", "--detach", str(path), "main")
+        repo = Repository.discover(self.repository.root)
+        worktree = repo.managed_worktree(path)
+        self.assertIsNotNone(worktree)
+        node = repo.hierarchy().nodes[worktree.id]
+
+        with self.assertRaisesRegex(RuntimeError, "create a branch"):
+            Picker(repo)._remove(node, repo.hierarchy(), delete_branch=False)
+
+    def test_missing_locked_worktree_rejects_actions(self):
+        repo = Repository.discover(self.repository.root)
+        worktree = repo.add_worktree("locked-missing", "main")
+        git(self.repository.root, "worktree", "lock", str(worktree.path))
+        shutil.rmtree(worktree.path)
+        repo = Repository.discover(self.repository.root)
+        worktree = repo.worktree_for_branch("locked-missing")
+        self.assertIsNotNone(worktree)
+        self.assertIsNotNone(worktree.locked)
+        node = repo.hierarchy().nodes[worktree.id]
+
+        with self.assertRaisesRegex(RuntimeError, "path is missing"):
+            Picker(repo)._handle("ctrl-a", node, repo.hierarchy())
 
     def test_opening_virtual_branch_creates_worktree_and_session(self):
         git(self.repository.root, "branch", "parent", "main")
@@ -94,7 +192,7 @@ class VirtualBranchTests(unittest.TestCase):
         repo.remove_worktree(worktree)
         refreshed = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(refreshed, refreshed.hierarchy())
+        rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
 
         self.assertTrue(
             any("local-feature  [L branch]" in display for display, _ in rows)
@@ -144,7 +242,7 @@ class VirtualBranchTests(unittest.TestCase):
         repo.set_local_parent("child", "a")
         refreshed = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(refreshed, refreshed.hierarchy())
+        rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
         displays = [display for display, _ in rows]
 
         self.assertTrue(any("a  [L branch]" in value for value in displays))
@@ -158,13 +256,125 @@ class VirtualBranchTests(unittest.TestCase):
         git(self.repository.root, "worktree", "add", str(external_path), "external")
         repo = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
         external = next(
             node for display, node in rows if "external  [L external]" in display
         )
 
         self.assertIsInstance(external, VirtualBranchNode)
         self.assertEqual(external_path.resolve(), external.external_path)
+
+    def test_untracked_external_worktree_appears_in_recovery_view(self):
+        repo = Repository.discover(self.repository.root)
+        parent = repo.add_worktree("managed-parent", "main")
+        self.repository.add_commit(parent.path, "parent.txt", "parent\n")
+        external_path = self.repository.root.parent / "ordinary-external"
+        git(self.repository.root, "branch", "ordinary-external", "managed-parent")
+        git(
+            self.repository.root,
+            "worktree",
+            "add",
+            str(external_path),
+            "ordinary-external",
+        )
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
+        recovery_json = json.loads(
+            hierarchy_as_json(repo, repo.hierarchy(), include_inactive=True)
+        )
+
+        self.assertTrue(
+            any("ordinary-external  [? external]" in display for display, _ in rows)
+        )
+        external_node = next(
+            node
+            for _, node in rows
+            if isinstance(node, VirtualBranchNode)
+            and node.branch == "ordinary-external"
+        )
+        self.assertEqual("managed-parent", external_node.direct_parent)
+        self.assertTrue(
+            any(
+                item["kind"] == "external"
+                and item["branch"] == "ordinary-external"
+                for item in recovery_json
+            )
+        )
+
+    def test_external_stack_preserves_external_parent(self):
+        parent_path = self.repository.root.parent / "external-parent"
+        child_path = self.repository.root.parent / "external-child"
+        git(self.repository.root, "branch", "external-parent", "main")
+        git(self.repository.root, "worktree", "add", str(parent_path), "external-parent")
+        self.repository.add_commit(parent_path, "parent.txt", "parent\n")
+        git(self.repository.root, "branch", "external-child", "external-parent")
+        git(self.repository.root, "worktree", "add", str(child_path), "external-child")
+        self.repository.add_commit(child_path, "child.txt", "child\n")
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
+        child = next(
+            node
+            for _, node in rows
+            if isinstance(node, VirtualBranchNode) and node.branch == "external-child"
+        )
+        recovery_json = json.loads(
+            hierarchy_as_json(repo, repo.hierarchy(), include_inactive=True)
+        )
+        child_json = next(
+            item for item in recovery_json if item["branch"] == "external-child"
+        )
+
+        self.assertEqual("external-parent", child.direct_parent)
+        self.assertEqual("branch:external-parent", child_json["visible_parent_id"])
+
+    def test_missing_locked_external_is_warned_and_diagnosed(self):
+        external_path = self.repository.root.parent / "locked-external"
+        git(self.repository.root, "branch", "locked-external", "main")
+        git(self.repository.root, "worktree", "add", str(external_path), "locked-external")
+        git(self.repository.root, "worktree", "lock", str(external_path))
+        shutil.rmtree(external_path)
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
+        issues = doctor(
+            repo,
+            tmux=TmuxManager(server_name=f"doctor-{uuid.uuid4().hex}"),
+        )
+
+        self.assertTrue(
+            any("locked-external  [? external] !" in display for display, _ in rows)
+        )
+        self.assertTrue(
+            any("missing external worktree" in issue and "locked-external" in issue for issue in issues)
+        )
+
+    def test_duplicate_branch_registration_is_diagnosed(self):
+        external_path = self.repository.root.parent / "duplicate-main"
+        git(
+            self.repository.root,
+            "worktree",
+            "add",
+            "--force",
+            str(external_path),
+            "main",
+        )
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
+        recovery_json = json.loads(
+            hierarchy_as_json(repo, repo.hierarchy(), include_inactive=True)
+        )
+        issues = doctor(
+            repo,
+            tmux=TmuxManager(server_name=f"duplicate-{uuid.uuid4().hex}"),
+        )
+        main_json = next(item for item in recovery_json if item["branch"] == "main")
+
+        self.assertTrue(rows[0][0].endswith("[ ] !"))
+        self.assertEqual([str(external_path.resolve())], main_json["external_paths"])
+        self.assertTrue(any("multiple worktree registrations" in issue for issue in issues))
 
     def test_virtual_open_rolls_back_when_remembering_fails(self):
         git(self.repository.root, "branch", "locked", "main")
@@ -193,7 +403,7 @@ class VirtualBranchTests(unittest.TestCase):
         runner = FakeGraphiteRunner({"main": None, "stack-only": "main"})
         repo = Repository.discover(self.repository.root, runner)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
 
         self.assertTrue(
             any("stack-only  [G branch]" in display for display, _ in rows)
@@ -209,7 +419,7 @@ class VirtualBranchTests(unittest.TestCase):
         runner = FakeGraphiteRunner({"main": None, branch: "main"})
         repo = Repository.discover(self.repository.root, runner)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
 
         self.assertTrue(any(f"{branch}  [G branch]" in display for display, _ in rows))
 
@@ -219,7 +429,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
         repo = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
 
         self.assertFalse(any("stale" in display for display, _ in rows))
 
@@ -236,7 +446,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
         refreshed = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(refreshed, refreshed.hierarchy())
+        rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
 
         self.assertFalse(any("stale-parent" in display for display, _ in rows))
         self.assertTrue(any("child" in display for display, _ in rows))
@@ -252,7 +462,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
         repo = Repository.discover(self.repository.root)
 
-        rows = render_hierarchy(repo, repo.hierarchy())
+        rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
         displays = [display for display, _ in rows]
         parent_index = next(index for index, value in enumerate(displays) if "parent  [L branch]" in value)
         child_index = next(index for index, value in enumerate(displays) if "child  [L branch]" in value)

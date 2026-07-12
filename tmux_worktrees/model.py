@@ -334,6 +334,10 @@ class Repository:
         return [item for item in self.all_worktrees if item.path not in managed_paths]
 
     @property
+    def prunable_worktrees(self) -> list[Worktree]:
+        return [item for item in self.all_worktrees if item.prunable is not None]
+
+    @property
     def managed_directory_is_internal(self) -> bool:
         return _is_relative_to(self.worktrees_dir, self.root)
 
@@ -354,6 +358,20 @@ class Repository:
             self.git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode
             == 0
         )
+
+    def branch_tip(self, branch: str) -> str:
+        result = self.git(["rev-parse", "--verify", f"refs/heads/{branch}"])
+        return result.stdout.strip()
+
+    def branch_is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        result = self.git(
+            ["merge-base", "--is-ancestor", ancestor, descendant], check=False
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise CommandError(result)
 
     def worktree_for_branch(self, branch: str) -> Worktree | None:
         return next((item for item in self.all_worktrees if item.branch == branch), None)
@@ -402,6 +420,13 @@ class Repository:
         self.set_config(f"branch.{branch}.tmux-worktrees-parent", parent)
         self._parent_cache.pop(branch, None)
 
+    def unset_local_parent(self, branch: str) -> None:
+        self.git(
+            ["config", "--unset", f"branch.{branch}.tmux-worktrees-parent"],
+            check=False,
+        )
+        self._parent_cache.pop(branch, None)
+
     def direct_parent(self, worktree: Worktree) -> ParentInfo:
         if worktree.is_root:
             return ParentInfo(None, ParentSource.ROOT)
@@ -448,13 +473,27 @@ class Repository:
         self._parent_cache[branch] = info
         return info
 
-    def infer_parent(self, branch: str, *, allow_equal: bool = False) -> str | None:
+    def infer_parent(
+        self,
+        branch: str,
+        *,
+        allow_equal: bool = False,
+        include_external: bool = False,
+        exclude_branches: set[str] | None = None,
+    ) -> str | None:
         candidates_by_head: dict[str, list[str]] = {}
+        excluded = exclude_branches or set()
         target = self.worktree_for_branch(branch)
         target_head = target.head if target else None
-        for worktree in self.managed_worktrees:
+        candidates = self.all_worktrees if include_external else self.managed_worktrees
+        for worktree in candidates:
             candidate = worktree.branch
-            if not candidate or candidate == branch or not worktree.head:
+            if (
+                not candidate
+                or candidate == branch
+                or candidate in excluded
+                or not worktree.head
+            ):
                 continue
             if not allow_equal and target_head and worktree.head == target_head:
                 continue
@@ -672,6 +711,35 @@ class Repository:
             raise
         return self._worktree_from_path(path)
 
+    def switch_worktree_branch(
+        self,
+        worktree: Worktree,
+        *,
+        expected_branch: str,
+        target_branch: str,
+        expected_generation: str,
+        require_clean: bool = True,
+    ) -> None:
+        current = self.managed_worktree(worktree.path)
+        if current is None or current.branch != expected_branch:
+            raise RuntimeError("worktree branch changed during reconciliation")
+        if self.worktree_generation(current, create=False) != expected_generation:
+            raise RuntimeError("worktree generation changed during reconciliation")
+        if require_clean and not self.is_clean(current):
+            raise RuntimeError("worktree became dirty during reconciliation")
+        occupied = self.worktree_for_branch(target_branch)
+        if occupied is not None and occupied.id != current.id:
+            raise RuntimeError(f"branch {target_branch} is already checked out at {occupied.path}")
+        self.git(["switch", "--no-guess", target_branch], cwd=current.path)
+        refreshed = Repository.discover(current.path, self.runner)
+        switched = refreshed.managed_worktree(current.path)
+        if (
+            switched is None
+            or switched.branch != target_branch
+            or refreshed.worktree_generation(switched, create=False) != expected_generation
+        ):
+            raise RuntimeError("worktree branch switch could not be verified")
+
     def ensure_managed_directory_ignored(self) -> None:
         if not _is_relative_to(self.worktrees_dir, self.root):
             return
@@ -695,6 +763,7 @@ class Repository:
         worktree: Worktree,
         *,
         confirmed_ignored: IgnoredSnapshot | None = None,
+        preserve_parent: str | None = None,
     ) -> None:
         if worktree.is_root:
             raise RuntimeError("the main worktree cannot be removed")
@@ -703,11 +772,32 @@ class Repository:
             raise RuntimeError(f"worktree is locked{detail}")
         if not self.is_clean(worktree):
             raise RuntimeError("worktree is dirty; commit, stash, or clean it before removal")
-        ignored = self.ignored_paths(worktree)
-        current_snapshot = self.ignored_snapshot(worktree, ignored)
-        if current_snapshot != (confirmed_ignored or ()):
-            raise RuntimeError("ignored worktree content changed or was not confirmed; removal aborted")
-        self.git(["worktree", "remove", str(worktree.path)])
+        parent_added = bool(
+            worktree.branch
+            and preserve_parent
+            and self.local_parent(worktree.branch) is None
+        )
+        if parent_added:
+            self.set_local_parent(worktree.branch, preserve_parent)
+        try:
+            ignored = self.ignored_paths(worktree)
+            current_snapshot = self.ignored_snapshot(worktree, ignored)
+            if current_snapshot != (confirmed_ignored or ()):
+                raise RuntimeError(
+                    "ignored worktree content changed or was not confirmed; removal aborted"
+                )
+            self.git(["worktree", "remove", str(worktree.path)])
+        except (CommandError, RuntimeError):
+            if (
+                parent_added
+                and worktree.branch
+                and self.local_parent(worktree.branch) == preserve_parent
+            ):
+                self.git(
+                    ["config", "--unset", f"branch.{worktree.branch}.tmux-worktrees-parent"],
+                    check=False,
+                )
+            raise
 
     def branch_is_retained(self, branch: str, parent: str | None) -> bool:
         if not parent or not self.branch_exists(parent):

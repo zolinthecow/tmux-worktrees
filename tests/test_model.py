@@ -215,6 +215,40 @@ class RepositoryTests(unittest.TestCase):
         self.assertFalse(feature.path.exists())
         self.assertTrue(repo.branch_exists("feature"))
 
+    def test_remove_can_preserve_inferred_parent_for_recovery(self):
+        repo = Repository.discover(self.repository.root)
+        feature = repo.add_worktree("feature", "main")
+        git(self.repository.root, "config", "--unset", "branch.feature.tmux-worktrees-parent")
+        repo = Repository.discover(self.repository.root)
+        feature = repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+        node = repo.hierarchy().nodes[feature.id]
+        self.assertEqual(ParentSource.INFERRED, node.source)
+
+        repo.remove_worktree(feature, preserve_parent=node.direct_parent)
+
+        refreshed = Repository.discover(self.repository.root)
+        self.assertEqual("main", refreshed.local_parent("feature"))
+        self.assertTrue(refreshed.branch_exists("feature"))
+
+    def test_failed_remove_rolls_back_recovery_parent(self):
+        info_exclude = self.repository.root / ".git" / "info" / "exclude"
+        with info_exclude.open("a") as file:
+            file.write("*.cache\n")
+        repo = Repository.discover(self.repository.root)
+        feature = repo.add_worktree("feature", "main")
+        git(self.repository.root, "config", "--unset", "branch.feature.tmux-worktrees-parent")
+        (feature.path / "build.cache").write_text("generated\n")
+        repo = Repository.discover(self.repository.root)
+        feature = repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+
+        with self.assertRaisesRegex(RuntimeError, "ignored"):
+            repo.remove_worktree(feature, preserve_parent="main")
+
+        self.assertIsNone(repo.local_parent("feature"))
+        self.assertTrue(feature.path.exists())
+
     def test_branch_deletion_requires_tip_to_be_retained(self):
         repo = Repository.discover(self.repository.root)
         feature = repo.add_worktree("feature", "main")

@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import Repository, Worktree, _canonical_path, _is_relative_to
+from .model import ParentSource, Repository, Worktree, _canonical_path, _is_relative_to
 from .process import CommandError, Runner
 
 
@@ -261,6 +261,461 @@ class TmuxManager:
         }
         for option, value in values.items():
             self.run(["set-option", "-t", session_id, option, value])
+
+    def reconcile_session_switch(self, repo: Repository, session_id: str) -> Repository:
+        lock_name = "tmux-worktrees-reconcile-" + hashlib.sha256(
+            str(repo.common_dir).encode()
+        ).hexdigest()[:16]
+        lock_path = Path(tempfile.gettempdir()) / f"{lock_name}.lock"
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            return self._reconcile_session_switch(repo, session_id)
+
+    def _reconcile_session_switch(self, repo: Repository, session_id: str) -> Repository:
+        repo = Repository.discover(repo.root, repo.runner)
+        sessions = self.sessions()
+        session = next((item for item in sessions if item.id == session_id), None)
+        if (
+            session is None
+            or session.repo != str(repo.common_dir)
+            or not session.path
+            or not session.branch
+            or not session.generation
+        ):
+            return repo
+
+        worktree = repo.managed_worktree(session.path)
+        if worktree is None or worktree.is_root or worktree.branch == session.branch:
+            return repo
+        if (
+            worktree.branch is None
+            or worktree.locked is not None
+            or worktree.prunable is not None
+            or not worktree.path.exists()
+            or repo.worktree_generation(worktree, create=False) != session.generation
+        ):
+            raise RuntimeError("changed worktree identity cannot be reconciled safely")
+
+        matching_identity = [
+            item
+            for item in sessions
+            if item.repo == session.repo
+            and item.path == session.path
+            and item.generation == session.generation
+        ]
+        if matching_identity != [session]:
+            raise RuntimeError("multiple tmux sessions claim the changed worktree")
+
+        old_branch = session.branch
+        new_branch = worktree.branch
+        if not repo.branch_exists(old_branch) or not repo.branch_exists(new_branch):
+            raise RuntimeError("branch disappeared during reconciliation")
+        if repo.worktree_for_branch(old_branch) is not None:
+            raise RuntimeError(f"branch {old_branch} is already checked out elsewhere")
+
+        old_tip = repo.branch_tip(old_branch)
+        new_tip = repo.branch_tip(new_branch)
+        new_info = repo.parent_for_virtual_branch(new_branch)
+        explicit_parent = new_info.source in {ParentSource.GRAPHITE, ParentSource.LOCAL}
+        based_on_old = (
+            new_info.parent == old_branch
+            if explicit_parent
+            else repo.branch_is_ancestor(old_branch, new_branch)
+        )
+        new_parent = (
+            new_info.parent
+            if explicit_parent and new_info.parent
+            else old_branch
+            if based_on_old
+            else repo.infer_parent(new_branch, allow_equal=True)
+            or repo.root_worktree.branch
+        )
+        if new_parent is None:
+            raise RuntimeError(f"cannot determine a parent for {new_branch}")
+
+        if based_on_old or not repo.is_clean(worktree):
+            refreshed = self._keep_current_worktree_on_new_branch(
+                repo,
+                worktree,
+                session,
+                old_branch=old_branch,
+                new_branch=new_branch,
+                old_tip=old_tip,
+                new_tip=new_tip,
+                new_parent=new_parent,
+                persist_new_parent=new_info.source
+                not in {ParentSource.GRAPHITE, ParentSource.LOCAL},
+            )
+        else:
+            refreshed = self._restore_current_worktree_to_old_branch(
+                repo,
+                worktree,
+                session,
+                old_branch=old_branch,
+                new_branch=new_branch,
+                old_tip=old_tip,
+                new_tip=new_tip,
+                new_parent=new_parent,
+                persist_new_parent=new_info.source
+                not in {ParentSource.GRAPHITE, ParentSource.LOCAL},
+            )
+        return refreshed
+
+    def _keep_current_worktree_on_new_branch(
+        self,
+        repo: Repository,
+        worktree: Worktree,
+        session: TmuxSession,
+        *,
+        old_branch: str,
+        new_branch: str,
+        old_tip: str,
+        new_tip: str,
+        new_parent: str,
+        persist_new_parent: bool,
+    ) -> Repository:
+        old_info = repo.parent_for_virtual_branch(old_branch)
+        old_parent = old_info.parent or repo.root_worktree.branch
+        if old_parent == new_branch:
+            if old_info.source in {ParentSource.GRAPHITE, ParentSource.LOCAL}:
+                raise RuntimeError(
+                    f"existing metadata would create a parent cycle: {old_branch} -> {new_branch}"
+                )
+            old_parent = (
+                repo.infer_parent(
+                    old_branch,
+                    allow_equal=True,
+                    exclude_branches={new_branch},
+                )
+                or repo.root_worktree.branch
+            )
+        if old_parent is None:
+            raise RuntimeError(f"cannot determine a parent for {old_branch}")
+        metadata_added = persist_new_parent and repo.local_parent(new_branch) is None
+        persist_old_parent = old_info.source not in {
+            ParentSource.GRAPHITE,
+            ParentSource.LOCAL,
+        }
+        old_metadata_added = persist_old_parent and repo.local_parent(old_branch) is None
+        if metadata_added:
+            repo.set_local_parent(new_branch, new_parent)
+
+        replacement = None
+        replacement_session = None
+        replacement_session_created = False
+        retagged_session = None
+        try:
+            self._verify_reconciliation_state(
+                repo,
+                worktree,
+                session,
+                old_branch=old_branch,
+                new_branch=new_branch,
+                old_tip=old_tip,
+                new_tip=new_tip,
+            )
+            replacement = repo.add_existing_worktree(
+                old_branch,
+                old_parent,
+                persist_parent=persist_old_parent,
+            )
+            refreshed = Repository.discover(repo.root, repo.runner)
+            managed_replacement = refreshed.managed_worktree(replacement.path)
+            managed_current = refreshed.managed_worktree(worktree.path)
+            if managed_replacement is None or managed_current is None:
+                raise RuntimeError("reconciled worktree could not be rediscovered")
+            replacement_session, replacement_session_created = self.ensure_session(
+                refreshed, managed_replacement
+            )
+            retagged_session = self._retag_session_branch(
+                session, refreshed, managed_current
+            )
+            self._verify_reconciled_pair(
+                refreshed,
+                original_session_id=session.id,
+                original_branch=new_branch,
+                replacement_branch=old_branch,
+            )
+            return refreshed
+        except (CommandError, RuntimeError):
+            if retagged_session is not None:
+                self._restore_retagged_session(retagged_session, session)
+            replacement_session_removed = True
+            if replacement_session_created and replacement_session is not None:
+                replacement_session_removed = self._kill_session_if_unchanged(
+                    replacement_session
+                )
+            if replacement is not None and replacement_session_removed:
+                rollback_repo = Repository.discover(repo.root, repo.runner)
+                managed = rollback_repo.managed_worktree(replacement.path)
+                if managed is not None and rollback_repo.is_clean(managed):
+                    rollback_repo.remove_worktree(managed)
+            if old_metadata_added and repo.local_parent(old_branch) == old_parent:
+                repo.unset_local_parent(old_branch)
+            if metadata_added and repo.local_parent(new_branch) == new_parent:
+                repo.unset_local_parent(new_branch)
+            raise
+
+    def _restore_current_worktree_to_old_branch(
+        self,
+        repo: Repository,
+        worktree: Worktree,
+        session: TmuxSession,
+        *,
+        old_branch: str,
+        new_branch: str,
+        old_tip: str,
+        new_tip: str,
+        new_parent: str,
+        persist_new_parent: bool,
+    ) -> Repository:
+        self._verify_reconciliation_state(
+            repo,
+            worktree,
+            session,
+            old_branch=old_branch,
+            new_branch=new_branch,
+            old_tip=old_tip,
+            new_tip=new_tip,
+        )
+        repo.switch_worktree_branch(
+            worktree,
+            expected_branch=new_branch,
+            target_branch=old_branch,
+            expected_generation=session.generation or "",
+        )
+        after_switch = Repository.discover(repo.root, repo.runner)
+        switched_original = after_switch.managed_worktree(worktree.path)
+        if switched_original is None:
+            raise RuntimeError("switched worktree could not be rediscovered")
+        if not after_switch.is_clean(switched_original):
+            after_switch.switch_worktree_branch(
+                switched_original,
+                expected_branch=old_branch,
+                target_branch=new_branch,
+                expected_generation=session.generation or "",
+                require_clean=False,
+            )
+            dirty_repo = Repository.discover(repo.root, repo.runner)
+            dirty_worktree = dirty_repo.managed_worktree(worktree.path)
+            if dirty_worktree is None:
+                raise RuntimeError("dirty worktree could not be rediscovered")
+            return self._keep_current_worktree_on_new_branch(
+                dirty_repo,
+                dirty_worktree,
+                session,
+                old_branch=old_branch,
+                new_branch=new_branch,
+                old_tip=old_tip,
+                new_tip=new_tip,
+                new_parent=new_parent,
+                persist_new_parent=persist_new_parent,
+            )
+        replacement = None
+        replacement_session = None
+        replacement_session_created = False
+        new_metadata_added = (
+            persist_new_parent and repo.local_parent(new_branch) is None
+        )
+        try:
+            refreshed = after_switch
+            replacement = refreshed.add_existing_worktree(
+                new_branch,
+                new_parent,
+                persist_parent=persist_new_parent,
+            )
+            refreshed = Repository.discover(repo.root, repo.runner)
+            managed_replacement = refreshed.managed_worktree(replacement.path)
+            if managed_replacement is None:
+                raise RuntimeError("new branch worktree could not be rediscovered")
+            replacement_session, replacement_session_created = self.ensure_session(
+                refreshed, managed_replacement
+            )
+            latest = Repository.discover(repo.root, repo.runner)
+            latest_original = latest.managed_worktree(worktree.path)
+            if latest_original is None:
+                raise RuntimeError("original worktree could not be rediscovered")
+            if not latest.is_clean(latest_original):
+                if not replacement_session_created or replacement_session is None:
+                    raise RuntimeError(
+                        "worktree became dirty after the replacement session was adopted"
+                    )
+                if not self._kill_session_if_unchanged(replacement_session):
+                    raise RuntimeError(
+                        "worktree became dirty after the replacement session was attached"
+                    )
+                latest_replacement = latest.managed_worktree(replacement.path)
+                if latest_replacement is None or not latest.is_clean(latest_replacement):
+                    raise RuntimeError("replacement worktree changed during reconciliation")
+                latest.remove_worktree(latest_replacement)
+                latest = Repository.discover(repo.root, repo.runner)
+                latest_original = latest.managed_worktree(worktree.path)
+                if latest_original is None:
+                    raise RuntimeError("original worktree could not be rediscovered")
+                latest.switch_worktree_branch(
+                    latest_original,
+                    expected_branch=old_branch,
+                    target_branch=new_branch,
+                    expected_generation=session.generation or "",
+                    require_clean=False,
+                )
+                dirty_repo = Repository.discover(repo.root, repo.runner)
+                dirty_worktree = dirty_repo.managed_worktree(worktree.path)
+                if dirty_worktree is None:
+                    raise RuntimeError("dirty worktree could not be rediscovered")
+                return self._keep_current_worktree_on_new_branch(
+                    dirty_repo,
+                    dirty_worktree,
+                    session,
+                    old_branch=old_branch,
+                    new_branch=new_branch,
+                    old_tip=old_tip,
+                    new_tip=new_tip,
+                    new_parent=new_parent,
+                    persist_new_parent=False,
+                )
+            self._verify_reconciled_pair(
+                refreshed,
+                original_session_id=session.id,
+                original_branch=old_branch,
+                replacement_branch=new_branch,
+            )
+            return refreshed
+        except (CommandError, RuntimeError):
+            rollback_repo = Repository.discover(repo.root, repo.runner)
+            replacement_session_removed = True
+            if replacement_session_created and replacement_session is not None:
+                replacement_session_removed = self._kill_session_if_unchanged(
+                    replacement_session
+                )
+            if replacement is not None and replacement_session_removed:
+                managed = rollback_repo.managed_worktree(replacement.path)
+                if managed is not None and rollback_repo.is_clean(managed):
+                    rollback_repo.remove_worktree(managed)
+                    rollback_repo = Repository.discover(repo.root, repo.runner)
+            if new_metadata_added and repo.local_parent(new_branch) == new_parent:
+                repo.unset_local_parent(new_branch)
+            original = rollback_repo.managed_worktree(worktree.path)
+            if original is not None and rollback_repo.is_clean(original):
+                rollback_repo.switch_worktree_branch(
+                    original,
+                    expected_branch=old_branch,
+                    target_branch=new_branch,
+                    expected_generation=session.generation or "",
+                )
+            raise
+
+    def _verify_reconciliation_state(
+        self,
+        repo: Repository,
+        worktree: Worktree,
+        session: TmuxSession,
+        *,
+        old_branch: str,
+        new_branch: str,
+        old_tip: str,
+        new_tip: str,
+    ) -> None:
+        refreshed = Repository.discover(repo.root, repo.runner)
+        current = refreshed.managed_worktree(worktree.path)
+        current_session = next(
+            (item for item in self.sessions() if item.id == session.id), None
+        )
+        if (
+            current is None
+            or current.branch != new_branch
+            or refreshed.worktree_generation(current, create=False) != session.generation
+            or current_session != session
+            or refreshed.branch_tip(old_branch) != old_tip
+            or refreshed.branch_tip(new_branch) != new_tip
+        ):
+            raise RuntimeError("Git or tmux state changed during reconciliation")
+
+    def _retag_session_branch(
+        self,
+        expected: TmuxSession,
+        repo: Repository,
+        worktree: Worktree,
+    ) -> TmuxSession:
+        current = next((item for item in self.sessions() if item.id == expected.id), None)
+        if current != expected or worktree.branch is None:
+            raise RuntimeError("tmux session changed during reconciliation")
+        new_name = self.available_name(repo, worktree)
+        branch_changed = False
+        renamed = False
+        try:
+            self.run(
+                ["set-option", "-t", expected.id, SESSION_BRANCH_OPTION, worktree.branch]
+            )
+            branch_changed = True
+            if new_name != expected.name:
+                self.run(["rename-session", "-t", expected.id, new_name])
+                renamed = True
+            rebound = next(
+                (item for item in self.sessions() if item.id == expected.id), None
+            )
+            if (
+                rebound is None
+                or rebound.repo != expected.repo
+                or rebound.path != expected.path
+                or rebound.generation != expected.generation
+                or rebound.branch != worktree.branch
+            ):
+                raise RuntimeError("retagged tmux session could not be verified")
+            return rebound
+        except (CommandError, RuntimeError):
+            if renamed:
+                self.run(["rename-session", "-t", expected.id, expected.name], check=False)
+            if branch_changed:
+                self.run(
+                    ["set-option", "-t", expected.id, SESSION_BRANCH_OPTION, expected.branch or ""],
+                    check=False,
+                )
+            raise
+
+    def _restore_retagged_session(
+        self, expected: TmuxSession, original: TmuxSession
+    ) -> None:
+        current = next((item for item in self.sessions() if item.id == expected.id), None)
+        if current != expected:
+            raise RuntimeError("retagged tmux session changed before rollback")
+        if current.name != original.name:
+            self.run(["rename-session", "-t", current.id, original.name])
+        self.run(
+            ["set-option", "-t", current.id, SESSION_BRANCH_OPTION, original.branch or ""]
+        )
+        restored = next((item for item in self.sessions() if item.id == current.id), None)
+        if restored != original:
+            raise RuntimeError("tmux session identity rollback could not be verified")
+
+    def _kill_session_if_unchanged(self, expected: TmuxSession) -> bool:
+        current = next((item for item in self.sessions() if item.id == expected.id), None)
+        if current != expected or current.attached:
+            return False
+        self.kill_session(current.id)
+        return True
+
+    def _verify_reconciled_pair(
+        self,
+        repo: Repository,
+        *,
+        original_session_id: str,
+        original_branch: str,
+        replacement_branch: str,
+    ) -> None:
+        original = repo.worktree_for_branch(original_branch)
+        replacement = repo.worktree_for_branch(replacement_branch)
+        if original is None or replacement is None or original.id == replacement.id:
+            raise RuntimeError("reconciled branches do not have distinct worktrees")
+        original_session = self.lookup_session(repo, original)
+        replacement_session = self.lookup_session(repo, replacement)
+        if (
+            original_session is None
+            or original_session.id != original_session_id
+            or replacement_session is None
+            or replacement_session.id == original_session_id
+        ):
+            raise RuntimeError("reconciled tmux sessions could not be verified")
 
     def available_name(self, repo: Repository, worktree: Worktree) -> str:
         if worktree.is_root:

@@ -17,6 +17,7 @@ EXPECTED_KEYS = {
     "ctrl-p",
     "ctrl-x",
     "alt-x",
+    "ctrl-b",
     "ctrl-r",
 }
 
@@ -57,14 +58,21 @@ def source_badge(source: ParentSource) -> str:
     }[source]
 
 
-def render_hierarchy(
+def _hierarchy_rows(
     repo: Repository,
     hierarchy: Hierarchy,
     *,
     active_path: str | None = None,
-) -> list[tuple[str, PickerNode]]:
+    include_inactive: bool = False,
+) -> tuple[list[tuple[str, PickerNode]], dict[str, str | None]]:
     display_nodes: dict[str, _DisplayNode] = {}
     for node_id, node in hierarchy.nodes.items():
+        if (
+            not include_inactive
+            and not node.worktree.is_root
+            and (not node.worktree.path.exists() or node.worktree.prunable is not None)
+        ):
+            continue
         display_nodes[node_id] = _DisplayNode(
             id=node_id,
             label=node.worktree.label,
@@ -73,13 +81,39 @@ def render_hierarchy(
             picker_node=node,
         )
 
+    for display_node in display_nodes.values():
+        while display_node.parent_id and display_node.parent_id not in display_nodes:
+            display_node.parent_id = hierarchy.nodes[display_node.parent_id].parent_id
+
+    external_worktrees_by_branch: dict[str, list[Worktree]] = {}
+    for worktree in repo.external_worktrees:
+        if worktree.branch is not None:
+            external_worktrees_by_branch.setdefault(worktree.branch, []).append(worktree)
+    for worktrees in external_worktrees_by_branch.values():
+        worktrees.sort(key=lambda item: item.id)
     external_by_branch = {
-        worktree.branch: worktree.path
+        branch: worktrees[0].path
+        for branch, worktrees in external_worktrees_by_branch.items()
+    }
+    stale_external_branches = {
+        worktree.branch
         for worktree in repo.external_worktrees
         if worktree.branch is not None
+        and (worktree.prunable is not None or not worktree.path.exists())
     }
 
+    def external_warnings(branch: str) -> tuple[str, ...]:
+        warnings: list[str] = []
+        if branch in stale_external_branches:
+            warnings.append("registered worktree path is missing")
+        count = len(external_worktrees_by_branch.get(branch, []))
+        if count > 1:
+            warnings.append(f"{count} external registrations share this branch")
+        return tuple(warnings)
+
     for node_id, node in hierarchy.nodes.items():
+        if not include_inactive or node_id not in display_nodes:
+            continue
         if node_id == hierarchy.root_id or not node.skipped_parents:
             continue
         display_parent = node.parent_id or hierarchy.root_id
@@ -95,7 +129,7 @@ def render_hierarchy(
                     branch=branch,
                     direct_parent=parent_info.parent,
                     source=parent_info.source,
-                    warnings=warnings,
+                    warnings=warnings + external_warnings(branch),
                     external_path=external_by_branch.get(branch),
                 )
                 virtual = _DisplayNode(
@@ -114,7 +148,8 @@ def render_hierarchy(
         for node_id, node in hierarchy.nodes.items()
         if node.worktree.branch is not None
     }
-    for branch, parent in repo.graphite.tracked_parents().items():
+    graphite_parents = repo.graphite.tracked_parents() if include_inactive else {}
+    for branch, parent in graphite_parents.items():
         if branch in managed_by_branch:
             continue
         virtual_id = f"branch:{branch}"
@@ -128,11 +163,13 @@ def render_hierarchy(
                     branch=branch,
                     direct_parent=parent,
                     source=ParentSource.GRAPHITE,
+                    warnings=external_warnings(branch),
                     external_path=external_by_branch.get(branch),
                 ),
             )
 
-    for branch, parent in repo.local_parents().items():
+    local_parents = repo.local_parents() if include_inactive else {}
+    for branch, parent in local_parents.items():
         if branch in managed_by_branch:
             continue
         virtual_id = f"branch:{branch}"
@@ -146,7 +183,37 @@ def render_hierarchy(
                     branch=branch,
                     direct_parent=parent,
                     source=ParentSource.LOCAL,
+                    warnings=external_warnings(branch),
                     external_path=external_by_branch.get(branch),
+                ),
+            )
+
+    if include_inactive:
+        for branch, path in external_by_branch.items():
+            if branch in managed_by_branch:
+                continue
+            virtual_id = f"branch:{branch}"
+            if virtual_id in display_nodes:
+                continue
+            parent = (
+                repo.infer_parent(
+                    branch,
+                    allow_equal=True,
+                    include_external=True,
+                )
+                or repo.root_worktree.branch
+            )
+            display_nodes[virtual_id] = _DisplayNode(
+                id=virtual_id,
+                label=branch,
+                parent_id=None,
+                source=ParentSource.INFERRED,
+                picker_node=VirtualBranchNode(
+                    branch=branch,
+                    direct_parent=parent,
+                    source=ParentSource.INFERRED,
+                    warnings=external_warnings(branch),
+                    external_path=path,
                 ),
             )
 
@@ -219,7 +286,13 @@ def render_hierarchy(
             active = "*" if active_path == worktree.id else " "
             path_label = worktree.path.name
             secondary = f" ({path_label}/)" if path_label != worktree.label else ""
-            warning = " !" if picker_node.warnings or worktree.prunable is not None else ""
+            warning = (
+                " !"
+                if picker_node.warnings
+                or worktree.prunable is not None
+                or worktree.branch in external_worktrees_by_branch
+                else ""
+            )
             suffix = f"[{badge}]{warning}"
         else:
             active = " "
@@ -237,26 +310,95 @@ def render_hierarchy(
             visit(child_id, child_prefix, child_connector)
 
     visit(hierarchy.root_id, "", "")
+    return rows, {
+        node_id: display_node.parent_id
+        for node_id, display_node in display_nodes.items()
+    }
+
+
+def render_hierarchy(
+    repo: Repository,
+    hierarchy: Hierarchy,
+    *,
+    active_path: str | None = None,
+    include_inactive: bool = False,
+) -> list[tuple[str, PickerNode]]:
+    rows, _ = _hierarchy_rows(
+        repo,
+        hierarchy,
+        active_path=active_path,
+        include_inactive=include_inactive,
+    )
     return rows
 
 
-def hierarchy_as_json(hierarchy: Hierarchy) -> str:
+def hierarchy_as_json(
+    repo: Repository,
+    hierarchy: Hierarchy,
+    *,
+    include_inactive: bool = False,
+) -> str:
     data = []
-    for node_id in hierarchy.ordered_ids():
-        node = hierarchy.nodes[node_id]
+    rows, visible_parents = _hierarchy_rows(
+        repo, hierarchy, include_inactive=include_inactive
+    )
+    for _, node in rows:
+        if isinstance(node, HierarchyNode):
+            node_id = node.worktree.id
+            visible_parent = visible_parents[node_id]
+            external_paths = [
+                str(worktree.path)
+                for worktree in repo.external_worktrees
+                if worktree.branch and worktree.branch == node.worktree.branch
+            ]
+            data.append(
+                {
+                    "id": node_id,
+                    "kind": "worktree",
+                    "path": str(node.worktree.path),
+                    "external_paths": external_paths,
+                    "branch": node.worktree.branch,
+                    "head": node.worktree.head,
+                    "source": node.source.value,
+                    "direct_parent": node.direct_parent,
+                    "visible_parent_id": visible_parent,
+                    "visible_parent_path": (
+                        visible_parent
+                        if visible_parent and not visible_parent.startswith("branch:")
+                        else None
+                    ),
+                    "skipped_parents": node.skipped_parents,
+                    "warnings": node.warnings,
+                    "locked": node.worktree.locked,
+                    "prunable": node.worktree.prunable,
+                    "detached": node.worktree.detached,
+                }
+            )
+            continue
+
+        existing = repo.worktree_for_branch(node.branch)
+        external_paths = [
+            str(worktree.path)
+            for worktree in repo.external_worktrees
+            if worktree.branch == node.branch
+        ]
         data.append(
             {
-                "path": str(node.worktree.path),
-                "branch": node.worktree.branch,
-                "head": node.worktree.head,
+                "id": node.id,
+                "kind": "external" if node.external_path else "branch",
+                "path": str(node.external_path) if node.external_path else None,
+                "external_paths": external_paths,
+                "branch": node.branch,
+                "head": existing.head if existing else None,
                 "source": node.source.value,
                 "direct_parent": node.direct_parent,
-                "visible_parent_path": node.parent_id,
-                "skipped_parents": node.skipped_parents,
-                "warnings": node.warnings,
-                "locked": node.worktree.locked,
-                "prunable": node.worktree.prunable,
-                "detached": node.worktree.detached,
+                "visible_parent_id": visible_parents[node.id],
+                "visible_parent_path": None,
+                "skipped_parents": [],
+                "warnings": list(node.warnings),
+                "locked": existing.locked if existing else None,
+                "prunable": existing.prunable if existing else None,
+                "detached": False,
             }
         )
     return json.dumps(data, indent=2)
@@ -276,13 +418,27 @@ class Picker:
         self.executable = executable or str(Path(sys.argv[0]).resolve())
 
     def run(self) -> None:
+        include_inactive = False
         while True:
-            self.repo = Repository.discover(self.repo.root, self.runner)
+            current_session_id = self.tmux.current_session_id()
+            try:
+                if current_session_id is not None:
+                    self.repo = self.tmux.reconcile_session_switch(
+                        self.repo, current_session_id
+                    )
+                else:
+                    self.repo = Repository.discover(self.repo.root, self.runner)
+            except (RuntimeError, CommandError) as error:
+                self._pause(f"Error reconciling branch switch: {error}")
+                return
             hierarchy = self.repo.hierarchy()
-            selected = self._select(hierarchy)
+            selected = self._select(hierarchy, include_inactive=include_inactive)
             if selected is None:
                 return
             key, node = selected
+            if key == "ctrl-b":
+                include_inactive = not include_inactive
+                continue
             try:
                 if key != "ctrl-r":
                     node, hierarchy = self._refresh_picker_node(node, exact=False)
@@ -293,13 +449,20 @@ class Picker:
             if should_exit:
                 return
 
-    def _select(self, hierarchy: Hierarchy) -> tuple[str, PickerNode] | None:
+    def _select(
+        self, hierarchy: Hierarchy, *, include_inactive: bool
+    ) -> tuple[str, PickerNode] | None:
         current_path = self.tmux.current_pane_path()
         active_worktree = (
             self.tmux.worktree_for_path(self.repo, current_path) if current_path is not None else None
         )
         active_path = active_worktree.id if active_worktree else None
-        rows = render_hierarchy(self.repo, hierarchy, active_path=active_path)
+        rows = render_hierarchy(
+            self.repo,
+            hierarchy,
+            active_path=active_path,
+            include_inactive=include_inactive,
+        )
         payload_rows: list[str] = []
         selections: dict[tuple[str, str], PickerNode] = {}
         for display, node in rows:
@@ -325,7 +488,9 @@ class Picker:
             "--delimiter=\t",
             "--with-nth=1",
             "--expect=" + ",".join(sorted(EXPECTED_KEYS)),
-            "--header=enter open | ctrl-a add | ctrl-t track | ctrl-p reparent | ctrl-x remove | alt-x remove+delete | ctrl-r refresh",
+            "--header=enter open | ctrl-a add | ctrl-b "
+            + ("active only" if include_inactive else "show inactive")
+            + " | ctrl-x deactivate | alt-x delete | ctrl-r refresh",
             "--preview",
             preview,
             "--preview-window=right,55%,wrap",
@@ -356,14 +521,13 @@ class Picker:
             return False
         if isinstance(node, VirtualBranchNode):
             if key == "enter":
-                if node.external_path is not None:
-                    raise RuntimeError(
-                        f"{node.branch} is checked out in an external worktree: {node.external_path}"
-                    )
-                self._open_virtual_branch(node)
-                return True
+                return self._open_virtual_branch(node)
             raise RuntimeError(
                 f"{node.branch} has no managed worktree; press Enter to create and open it"
+            )
+        if not node.worktree.path.exists() or node.worktree.prunable is not None:
+            raise RuntimeError(
+                "worktree path is missing; run doctor and inspect stale registrations before pruning"
             )
         if key == "enter":
             session, _ = self.tmux.ensure_session(self.repo, node.worktree)
@@ -383,12 +547,19 @@ class Picker:
             return self._remove(node, hierarchy, delete_branch=True)
         return False
 
-    def _open_virtual_branch(self, node: VirtualBranchNode) -> None:
+    def _open_virtual_branch(self, node: VirtualBranchNode) -> bool:
         if not self.repo.branch_exists(node.branch):
             raise RuntimeError(f"branch no longer exists: {node.branch}")
         existing = self.repo.worktree_for_branch(node.branch)
         if existing is not None:
-            raise RuntimeError(f"branch is already checked out outside the managed directory: {existing.path}")
+            detail = (
+                "stale registration"
+                if existing.prunable is not None or not existing.path.exists()
+                else "external worktree"
+            )
+            raise RuntimeError(
+                f"branch is already checked out in a {detail}: {existing.path}"
+            )
         parent = node.direct_parent or self.repo.root_worktree.branch
         if parent is None:
             raise RuntimeError(f"cannot determine a parent for {node.branch}")
@@ -417,6 +588,7 @@ class Picker:
             except (CommandError, RuntimeError):
                 pass
             raise
+        return True
 
     def _add(self, parent_node: HierarchyNode) -> bool:
         parent = parent_node.worktree
@@ -502,7 +674,11 @@ class Picker:
         candidates = [
             item
             for item in self.repo.managed_worktrees
-            if item.branch and item.id != worktree.id and item.id not in descendants
+            if item.branch
+            and item.id != worktree.id
+            and item.id not in descendants
+            and item.path.exists()
+            and item.prunable is None
         ]
         payload = "\n".join(f"{item.branch}\t{item.path}" for item in candidates)
         result = self.runner.run(
@@ -535,8 +711,10 @@ class Picker:
         worktree = node.worktree
         if worktree.is_root:
             raise RuntimeError("the main worktree cannot be removed")
-        if worktree.branch is None and delete_branch:
-            raise RuntimeError("a detached worktree has no branch to delete")
+        if worktree.branch is None:
+            raise RuntimeError(
+                "detached worktrees cannot be deactivated safely; create a branch for this commit first"
+            )
         if delete_branch and node.source == ParentSource.GRAPHITE:
             raise RuntimeError(
                 "remove the checkout with ctrl-x, then run gt delete manually from another worktree"
@@ -565,11 +743,13 @@ class Picker:
                 print(f"          {path}")
 
         if delete_branch:
-            print("The checkout will be removed first. Branch deletion remains non-forced.")
-            confirmation = input(f"Type {worktree.branch} to remove the checkout and branch: ").strip()
+            print("The checkout will be deactivated first. Branch deletion remains non-forced.")
+            confirmation = input(
+                f"Type {worktree.branch} to deactivate the checkout and delete its branch: "
+            ).strip()
             if confirmation != worktree.branch:
                 return False
-        elif not self._confirm("Remove this checkout and keep its branch?"):
+        elif not self._confirm("Deactivate this checkout and keep its branch?"):
             return False
 
         kill_session = bool(session) and self._confirm(
@@ -578,9 +758,7 @@ class Picker:
 
         node, hierarchy = self._refresh_selected(node, exact=True)
         worktree = node.worktree
-        parent_worktree = (
-            hierarchy.nodes[node.parent_id].worktree if node.parent_id else self.repo.root_worktree
-        )
+        parent_worktree = self._nearest_active_parent(hierarchy, node)
         session = self.tmux.lookup_session(self.repo, worktree)
         if session and confirmed_session_id and session.id != confirmed_session_id:
             raise RuntimeError("tmux session changed while awaiting confirmation; action aborted")
@@ -599,7 +777,11 @@ class Picker:
                 raise RuntimeError(
                     "branch tip is not retained by its logical parent; refusing non-interactive deletion"
                 )
-        self.repo.remove_worktree(worktree, confirmed_ignored=ignored_snapshot)
+        self.repo.remove_worktree(
+            worktree,
+            confirmed_ignored=ignored_snapshot,
+            preserve_parent=node.direct_parent or self.repo.root_worktree.branch,
+        )
 
         branch_error: str | None = None
         if delete_branch and worktree.branch:
@@ -679,7 +861,9 @@ class Picker:
             return hierarchy.nodes[managed.id], hierarchy
         if not refreshed.branch_exists(node.branch):
             raise RuntimeError(f"branch no longer exists: {node.branch}")
-        for _, candidate in render_hierarchy(refreshed, hierarchy):
+        for _, candidate in render_hierarchy(
+            refreshed, hierarchy, include_inactive=True
+        ):
             if isinstance(candidate, VirtualBranchNode) and candidate.branch == node.branch:
                 if exact and (
                     candidate.direct_parent != node.direct_parent
@@ -700,6 +884,18 @@ class Picker:
             descendants.add(child)
             pending.extend(hierarchy.children.get(child, []))
         return descendants
+
+    def _nearest_active_parent(
+        self, hierarchy: Hierarchy, node: HierarchyNode
+    ) -> Worktree:
+        parent_id = node.parent_id
+        while parent_id:
+            parent = hierarchy.nodes[parent_id]
+            worktree = parent.worktree
+            if worktree.path.exists() and worktree.prunable is None:
+                return worktree
+            parent_id = parent.parent_id
+        return self.repo.root_worktree
 
     def _confirm(self, prompt: str) -> bool:
         return input(f"{prompt} [y/N] ").strip().lower() in {"y", "yes"}
@@ -762,7 +958,11 @@ def preview_branch(repo_root: Path, branch: str, runner: Runner | None = None) -
     lines = [
         branch,
         (
-            f"External worktree: {external_path}"
+            f"Stale worktree registration: {external_path}"
+            if external_path
+            and existing
+            and (existing.prunable is not None or not existing.path.exists())
+            else f"External worktree: {external_path}"
             if external_path
             else "Branch only; no managed worktree"
         ),
@@ -771,7 +971,11 @@ def preview_branch(repo_root: Path, branch: str, runner: Runner | None = None) -
         f"Direct parent: {info.parent or '-'}",
         "",
         (
-            "External worktrees are display-only in this navigator."
+            "Inspect stale registrations with doctor before pruning them manually."
+            if external_path
+            and existing
+            and (existing.prunable is not None or not existing.path.exists())
+            else "External worktrees are display-only in this navigator."
             if external_path
             else "Press Enter to create its worktree and open a tmux session."
         ),
@@ -803,9 +1007,30 @@ def doctor(repo: Repository, tmux: TmuxManager | None = None) -> list[str]:
             issues.append(f"locked worktree: {worktree.path}")
         if worktree.prunable is not None:
             issues.append(f"prunable worktree: {worktree.path}")
+        elif not worktree.path.exists():
+            issues.append(f"missing worktree path: {worktree.path}")
         if node.source == ParentSource.INFERRED and not worktree.is_root:
             issues.append(f"inferred parent for {worktree.label}: {node.direct_parent or 'none'}")
         issues.extend(f"{worktree.label}: {warning}" for warning in node.warnings)
+    managed_ids = {item.id for item in repo.managed_worktrees}
+    for worktree in repo.external_worktrees:
+        if worktree.id not in managed_ids and (
+            worktree.prunable is not None or not worktree.path.exists()
+        ):
+            identity = (
+                f"branch {worktree.branch}"
+                if worktree.branch
+                else f"detached at {(worktree.head or 'unknown')[:12]}"
+            )
+            issues.append(f"missing external worktree: {worktree.path} ({identity})")
+    by_branch: dict[str, list[Worktree]] = {}
+    for worktree in repo.all_worktrees:
+        if worktree.branch:
+            by_branch.setdefault(worktree.branch, []).append(worktree)
+    for branch, worktrees in by_branch.items():
+        if len(worktrees) > 1:
+            paths = ", ".join(str(item.path) for item in worktrees)
+            issues.append(f"branch has multiple worktree registrations: {branch} ({paths})")
     tmux = tmux or TmuxManager(repo.runner)
     if tmux.is_running():
         sessions = tmux.sessions()

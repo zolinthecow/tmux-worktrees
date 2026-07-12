@@ -5,8 +5,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from tests.test_model import TemporaryRepository
+from tests.test_model import TemporaryRepository, git
 from tmux_worktrees.model import Repository
+from tmux_worktrees.process import Runner
 from tmux_worktrees.tmux import TmuxManager
 
 
@@ -34,6 +35,134 @@ class TmuxTests(unittest.TestCase):
         tagged = next(item for item in self.tmux.sessions() if item.id == session.id)
         self.assertEqual(str(child.path), tagged.path)
         self.assertEqual("feature", tagged.branch)
+
+    def test_child_branch_switch_moves_original_session_to_child(self):
+        feature = self.repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+        original_session, _ = self.tmux.ensure_session(self.repo, feature)
+        git(feature.path, "switch", "-c", "child")
+        switched = Repository.discover(self.repository.root)
+
+        reconciled = self.tmux.reconcile_session_switch(
+            switched, original_session.id
+        )
+
+        child = reconciled.worktree_for_branch("child")
+        restored_feature = reconciled.worktree_for_branch("feature")
+        self.assertIsNotNone(child)
+        self.assertIsNotNone(restored_feature)
+        self.assertEqual(feature.id, child.id)
+        self.assertNotEqual(feature.id, restored_feature.id)
+        child_session = self.tmux.lookup_session(reconciled, child)
+        feature_session = self.tmux.lookup_session(reconciled, restored_feature)
+        self.assertEqual(original_session.id, child_session.id)
+        self.assertNotEqual(original_session.id, feature_session.id)
+        self.assertEqual("feature", reconciled.local_parent("child"))
+        self.assertEqual("main", reconciled.local_parent("feature"))
+
+    def test_clean_sibling_switch_keeps_original_session_on_old_branch(self):
+        feature = self.repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+        self.repository.add_commit(feature.path, "feature.txt", "feature\n")
+        self.repo = Repository.discover(self.repository.root)
+        feature = self.repo.worktree_for_branch("feature")
+        original_session, _ = self.tmux.ensure_session(self.repo, feature)
+        git(feature.path, "switch", "-c", "sibling", "main")
+        switched = Repository.discover(self.repository.root)
+
+        reconciled = self.tmux.reconcile_session_switch(
+            switched, original_session.id
+        )
+
+        restored_feature = reconciled.worktree_for_branch("feature")
+        sibling = reconciled.worktree_for_branch("sibling")
+        self.assertIsNotNone(restored_feature)
+        self.assertIsNotNone(sibling)
+        self.assertEqual(feature.id, restored_feature.id)
+        self.assertNotEqual(feature.id, sibling.id)
+        feature_session = self.tmux.lookup_session(reconciled, restored_feature)
+        sibling_session = self.tmux.lookup_session(reconciled, sibling)
+        self.assertEqual(original_session.id, feature_session.id)
+        self.assertNotEqual(original_session.id, sibling_session.id)
+        self.assertEqual("main", reconciled.local_parent("sibling"))
+
+    def test_dirty_sibling_switch_keeps_changes_with_new_branch(self):
+        feature = self.repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+        self.repository.add_commit(feature.path, "feature.txt", "feature\n")
+        self.repo = Repository.discover(self.repository.root)
+        feature = self.repo.worktree_for_branch("feature")
+        original_session, _ = self.tmux.ensure_session(self.repo, feature)
+        git(feature.path, "switch", "-c", "sibling", "main")
+        dirty_path = feature.path / "dirty.txt"
+        dirty_path.write_text("keep me\n")
+        switched = Repository.discover(self.repository.root)
+
+        reconciled = self.tmux.reconcile_session_switch(
+            switched, original_session.id
+        )
+
+        sibling = reconciled.worktree_for_branch("sibling")
+        restored_feature = reconciled.worktree_for_branch("feature")
+        self.assertIsNotNone(sibling)
+        self.assertIsNotNone(restored_feature)
+        self.assertEqual(feature.id, sibling.id)
+        self.assertNotEqual(feature.id, restored_feature.id)
+        self.assertEqual("keep me\n", dirty_path.read_text())
+        sibling_session = self.tmux.lookup_session(reconciled, sibling)
+        feature_session = self.tmux.lookup_session(reconciled, restored_feature)
+        self.assertEqual(original_session.id, sibling_session.id)
+        self.assertNotEqual(original_session.id, feature_session.id)
+        self.assertEqual("main", reconciled.local_parent("sibling"))
+
+    def test_clean_switch_that_becomes_dirty_falls_back_to_new_branch(self):
+        feature = self.repo.worktree_for_branch("feature")
+        self.assertIsNotNone(feature)
+        self.repository.add_commit(feature.path, "feature.txt", "feature\n")
+        git(feature.path, "switch", "-c", "sibling", "main")
+
+        class DirtyAfterSwitchRunner(Runner):
+            def __init__(self, path: Path):
+                super().__init__()
+                self.path = path
+                self.injected = False
+
+            def run(self, args, **kwargs):
+                result = super().run(args, **kwargs)
+                command = tuple(str(item) for item in args)
+                if (
+                    not self.injected
+                    and "switch" in command
+                    and command[-1] == "feature"
+                    and result.returncode == 0
+                ):
+                    self.injected = True
+                    (self.path / "raced.txt").write_text("raced\n")
+                return result
+
+        runner = DirtyAfterSwitchRunner(feature.path)
+        repo = Repository.discover(self.repository.root, runner)
+        manager = TmuxManager(runner, server_name=self.server)
+        stale_feature = repo.managed_worktree(feature.path)
+        self.assertIsNotNone(stale_feature)
+        git(feature.path, "switch", "feature")
+        repo = Repository.discover(self.repository.root, runner)
+        stale_feature = repo.managed_worktree(feature.path)
+        original_session, _ = manager.ensure_session(repo, stale_feature)
+        git(feature.path, "switch", "sibling")
+        switched = Repository.discover(self.repository.root, runner)
+
+        reconciled = manager.reconcile_session_switch(switched, original_session.id)
+
+        sibling = reconciled.worktree_for_branch("sibling")
+        restored_feature = reconciled.worktree_for_branch("feature")
+        self.assertIsNotNone(sibling)
+        self.assertIsNotNone(restored_feature)
+        self.assertEqual(feature.id, sibling.id)
+        self.assertEqual("raced\n", (feature.path / "raced.txt").read_text())
+        self.assertEqual(
+            original_session.id, manager.lookup_session(reconciled, sibling).id
+        )
 
     def test_recreated_worktree_does_not_reuse_old_generation_session(self):
         child = self.repo.worktree_for_branch("feature")

@@ -17,6 +17,7 @@ From inside a Git repository or managed worktree:
 ```sh
 ./tmux-worktrees pick
 ./tmux-worktrees list
+./tmux-worktrees list --all
 ./tmux-worktrees list --json
 ./tmux-worktrees doctor
 ```
@@ -35,16 +36,27 @@ The main checkout reuses the project session created by `tmux-sessionizer` when 
 | `ctrl-a` | Create a child branch and worktree |
 | `ctrl-t` | Track an ordinary branch with Graphite using its current logical parent |
 | `ctrl-p` | Reparent an ordinary local branch |
-| `ctrl-x` | Remove a clean checkout while keeping its branch |
-| `alt-x` | Remove a clean checkout and safely delete its ordinary local branch |
+| `ctrl-b` | Toggle inactive branches and external worktrees |
+| `ctrl-x` | Deactivate a clean checkout while keeping its branch |
+| `alt-x` | Deactivate a clean checkout and safely delete its ordinary local branch |
 | `ctrl-r` | Refresh Git, Graphite, and tmux state |
 | `esc` | Close the popup |
 
 Relationship badges are `G` for Graphite, `L` for explicit local metadata, `?` for inferred Git ancestry, `D` for detached, and `!` for unresolved provider state.
 
-Branches in Graphite or the local hierarchy remain visible even when they have no managed checkout. These rows are marked `[G branch]` or `[L branch]`; pressing `Enter` creates the worktree and opens its tmux session.
+The default picker contains only active managed checkouts. Press `ctrl-b` to show inactive branches from the Graphite or local hierarchy; these rows are marked `[G branch]` or `[L branch]`. Pressing `Enter` recreates the worktree and opens its tmux session. `list --all` exposes the same recovery view.
 
-Branches already checked out by an IDE or agent outside the managed directory are marked `[G external]` or `[L external]` and remain display-only.
+Branches already checked out by an IDE or agent outside the managed directory are marked `[G external]` or `[L external]` in the recovery view and remain display-only.
+
+### Branch switches
+
+When the picker detects that the current managed worktree changed branches outside the navigator, it reconciles the worktrees and sessions automatically:
+
+- A child branch keeps the current worktree, panes, and session. The previous branch receives a new managed worktree and session.
+- A clean branch created from another base restores the current worktree and session to the previous branch, then creates a separate worktree and session for the new branch.
+- If that unrelated switch carries uncommitted changes, the current worktree and session stay with the new branch so those changes are not moved. The previous branch receives a new worktree and session.
+
+Graphite parent metadata remains authoritative. Otherwise, the navigator records local parent metadata while reconciling.
 
 ## Storage
 
@@ -81,14 +93,16 @@ Parent resolution uses this precedence:
 
 Graphite metadata is read from its local SQLite database in read-only mode for fast popup startup. The schema is checked first, and the public `gt` CLI is used as a compatibility fallback.
 
-Branches without worktrees are omitted from the selectable list. Their relationships are preserved by connecting a worktree to its nearest ancestor that also has a managed worktree. The preview shows skipped branch names.
+Branches without worktrees are omitted from the default selectable list. Their relationships are preserved by connecting a worktree to its nearest active ancestor. The `ctrl-b` recovery view includes them in their logical positions.
 
 ## Safety
 
 - The main checkout cannot be removed.
 - Dirty or locked worktrees cannot be removed.
+- Detached worktrees cannot be deactivated until their commit is placed on a branch.
 - Ignored roots are shown before removal and their recursive contents are snapshotted because Git otherwise deletes them silently.
 - Normal removal keeps the branch.
+- Missing external registrations are reported by `doctor` and are never pruned automatically.
 - Branch deletion never uses force and is blocked unless the branch tip is already reachable from its logical parent.
 - Graphite reparenting and branch deletion remain explicit `gt move`/`gt delete` operations because Graphite cannot make their multi-worktree restacks atomic.
 - Tmux sessions are identified with canonical user options instead of names.

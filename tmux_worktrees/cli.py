@@ -25,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     list_command = subcommands.add_parser("list", help="print the managed worktree hierarchy")
     list_command.add_argument("--cwd", type=Path, default=Path.cwd())
     list_command.add_argument("--json", action="store_true")
+    list_command.add_argument(
+        "--all", action="store_true", help="include inactive branches and external worktrees"
+    )
 
     preview_command = subcommands.add_parser("preview", help="render details for the fzf preview pane")
     preview_command.add_argument("--repo", type=Path, required=True)
@@ -73,12 +76,22 @@ def main(argv: list[str] | None = None) -> int:
         if command == "list":
             hierarchy = repo.hierarchy()
             if args.json:
-                print(hierarchy_as_json(hierarchy))
+                print(hierarchy_as_json(repo, hierarchy, include_inactive=args.all))
             else:
-                for display, _ in render_hierarchy(repo, hierarchy):
+                for display, _ in render_hierarchy(
+                    repo, hierarchy, include_inactive=args.all
+                ):
                     print(display)
-                if repo.external_worktrees:
+                if repo.external_worktrees and not args.all:
                     print(f"\n({len(repo.external_worktrees)} external worktree(s) hidden)")
+                elif args.all:
+                    detached_external = sum(
+                        item.branch is None for item in repo.external_worktrees
+                    )
+                    if detached_external:
+                        print(
+                            f"\n({detached_external} detached external worktree(s) omitted)"
+                        )
             return 0
         if command == "doctor":
             issues = doctor(repo)
