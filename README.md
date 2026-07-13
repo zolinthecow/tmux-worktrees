@@ -44,7 +44,7 @@ The main checkout reuses the project session created by `tmux-sessionizer` when 
 
 Relationship badges are `G` for Graphite, `L` for explicit local metadata, `?` for inferred Git ancestry, `D` for detached, and `!` for unresolved provider state.
 
-The default picker contains only active managed checkouts. Press `ctrl-b` to show inactive branches from the Graphite or local hierarchy; these rows are marked `[G branch]` or `[L branch]`. Pressing `Enter` recreates the worktree and opens its tmux session. `list --all` exposes the same recovery view.
+The default picker contains active managed checkouts plus any inactive branches needed to connect their stack hierarchy. Press `ctrl-b` to show all other inactive branches from the Graphite or local hierarchy; these rows are marked `[G branch]` or `[L branch]`. Pressing `Enter` recreates the worktree and opens its tmux session. `list --all` exposes the same recovery view.
 
 Branches already checked out by an IDE or agent outside the managed directory are marked `[G external]` or `[L external]` in the recovery view and remain display-only.
 
@@ -93,7 +93,7 @@ Parent resolution uses this precedence:
 
 Graphite metadata is read from its local SQLite database in read-only mode for fast popup startup. The schema is checked first, and the public `gt` CLI is used as a compatibility fallback.
 
-Branches without worktrees are omitted from the default selectable list. Their relationships are preserved by connecting a worktree to its nearest active ancestor. The `ctrl-b` recovery view includes them in their logical positions.
+Inactive leaf branches are omitted from the default selectable list. Branch-only nodes that connect active worktrees remain visible so stacks are not flattened. The `ctrl-b` recovery view includes every remaining inactive branch in its logical position.
 
 ## Safety
 

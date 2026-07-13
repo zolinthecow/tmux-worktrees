@@ -99,6 +99,28 @@ class VirtualBranchTests(unittest.TestCase):
         self.assertFalse(any("inactive" in display for display, _ in rows))
         self.assertEqual(1, len(rows))
 
+    def test_default_render_keeps_inactive_bridge_between_active_worktrees(self):
+        git(self.repository.root, "branch", "bridge", "main")
+        git(self.repository.root, "branch", "child", "bridge")
+        repo = Repository.discover(self.repository.root)
+        child = repo.add_worktree("child", "bridge")
+        repo.set_local_parent("bridge", "main")
+        repo.set_local_parent("child", "bridge")
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy())
+        displays = [display for display, _ in rows]
+
+        bridge_index = next(
+            index for index, display in enumerate(displays) if "bridge  [L branch]" in display
+        )
+        child_index = next(
+            index for index, display in enumerate(displays) if "child  [L]" in display
+        )
+        self.assertLess(bridge_index, child_index)
+        self.assertIn("└─ child", displays[child_index])
+        self.assertEqual(child.id, rows[child_index][1].worktree.id)
+
     def test_default_render_hides_missing_registered_worktree(self):
         repo = Repository.discover(self.repository.root)
         worktree = repo.add_worktree("missing", "main")

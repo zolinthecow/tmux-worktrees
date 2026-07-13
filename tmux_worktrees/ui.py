@@ -112,7 +112,7 @@ def _hierarchy_rows(
         return tuple(warnings)
 
     for node_id, node in hierarchy.nodes.items():
-        if not include_inactive or node_id not in display_nodes:
+        if node_id not in display_nodes:
             continue
         if node_id == hierarchy.root_id or not node.skipped_parents:
             continue
