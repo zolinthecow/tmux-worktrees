@@ -38,6 +38,24 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_command = subcommands.add_parser("doctor", help="report worktree and session problems")
     doctor_command.add_argument("--cwd", type=Path, default=Path.cwd())
 
+    register = subcommands.add_parser(
+        "register", help="import an open PR or create a draft PR for a branch"
+    )
+    register.add_argument("--cwd", type=Path, default=Path.cwd())
+    register.add_argument("--branch")
+    register.add_argument("--parent")
+    register.add_argument(
+        "--local",
+        action="store_true",
+        help="record the relationship without pushing or creating a PR",
+    )
+
+    unregister = subcommands.add_parser(
+        "unregister", help="remove a branch from the persistent local registry"
+    )
+    unregister.add_argument("--cwd", type=Path, default=Path.cwd())
+    unregister.add_argument("--branch")
+
     resume = subcommands.add_parser(
         "resume", help="switch to the last active worktree session for a repository"
     )
@@ -99,6 +117,27 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n".join(f"- {issue}" for issue in issues))
                 return 1
             print("No problems found.")
+            return 0
+        if command == "register":
+            branch = args.branch or repo.git(["branch", "--show-current"]).stdout.strip()
+            parent = args.parent or repo.trunk_branch
+            if not branch or not parent:
+                raise RuntimeError("register requires a branch and parent")
+            if branch == repo.trunk_branch:
+                raise RuntimeError("the trunk branch is already registered")
+            if args.local:
+                repo.register_local(branch, parent)
+                print(f"Registered {branch} locally on top of {parent}")
+                return 0
+            pull_request = repo.github.register(branch, parent)
+            print(f"Registered {branch} as PR #{pull_request.number}: {pull_request.url}")
+            return 0
+        if command == "unregister":
+            branch = args.branch or repo.git(["branch", "--show-current"]).stdout.strip()
+            if not branch:
+                raise RuntimeError("unregister requires a branch")
+            repo.unregister(branch)
+            print(f"Unregistered {branch}; its branch, worktree, and session were kept")
             return 0
         if command == "resume":
             TmuxManager(runner).resume_project(repo, args.root_session)

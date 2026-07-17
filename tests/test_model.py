@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -52,46 +51,31 @@ class TemporaryRepository:
         git(worktree, "commit", "-m", f"add {filename}")
 
 
-class FakeGraphiteRunner(Runner):
-    def __init__(self, parents: dict[str, str | None]):
-        super().__init__()
-        self.parents = parents
-
-    def run(self, args, **kwargs):
-        command = tuple(str(item) for item in args)
-        if command and command[0] == "gt":
-            if len(command) > 2 and command[1:3] == ("log", "short"):
-                output = "\n".join(f"  ↱ $ {branch}" for branch in self.parents)
-                return CommandResult(command, 0, output + "\n", "")
-            if len(command) > 1 and command[1] == "parent":
-                path = Path(command[command.index("--cwd") + 1])
-                branch = super().run(
-                    ["git", "-C", str(path), "branch", "--show-current"]
-                ).stdout.strip()
-            elif len(command) > 2 and command[1] == "info":
-                branch = command[2]
-            else:
-                return CommandResult(command, 1, "", "unsupported fake gt command")
-            if branch not in self.parents:
-                return CommandResult(
-                    command,
-                    1,
-                    "",
-                    f"Cannot perform this operation on untracked branch {branch}",
-                )
-            parent = self.parents[branch]
-            if command[1] == "parent":
-                return CommandResult(command, 0, f"{parent or ''}\n", "")
-            parent_line = f"\nParent: {parent}\n" if parent else "\n"
-            return CommandResult(command, 0, f"{branch}{parent_line}", "")
-        return super().run(args, **kwargs)
-
-
 class IgnoredStatusFailureRunner(Runner):
     def run(self, args, **kwargs):
         command = tuple(str(item) for item in args)
         if command and command[0] == "git" and "--ignored" in command:
             return CommandResult(command, 128, "", "ignored scan failed")
+        return super().run(args, **kwargs)
+
+
+class FakeGitHubRunner(Runner):
+    def __init__(self, pull_requests: list[dict], involved_heads: set[str] | None = None):
+        super().__init__()
+        self.pull_requests = pull_requests
+        self.involved_heads = involved_heads or set()
+
+    def run(self, args, **kwargs):
+        command = tuple(str(item) for item in args)
+        if command[:3] == ("gh", "pr", "list"):
+            rows = self.pull_requests
+            if "--search" in command:
+                rows = [
+                    {"headRefName": row["headRefName"]}
+                    for row in rows
+                    if row["headRefName"] in self.involved_heads
+                ]
+            return CommandResult(command, 0, json.dumps(rows), "")
         return super().run(args, **kwargs)
 
 
@@ -122,6 +106,8 @@ class RepositoryTests(unittest.TestCase):
 
         repo = Repository.discover(self.repository.root)
         feature_b = repo.add_worktree("feature-b", "feature-a")
+        repo.set_registered("feature-a", True)
+        repo.set_registered("feature-b", True)
         repo = Repository.discover(self.repository.root)
         hierarchy = repo.hierarchy()
 
@@ -134,66 +120,135 @@ class RepositoryTests(unittest.TestCase):
         self.repository.add_commit(feature_a.path, "a.txt", "a\n")
         git(self.repository.root, "branch", "bridge", "feature-a")
         repo.set_local_parent("bridge", "feature-a")
+        repo.set_registered("feature-a", True)
+        repo.set_registered("bridge", True)
         git(self.repository.root, "branch", "feature-b", "bridge")
         feature_b = repo.add_worktree("feature-b", "bridge")
+        repo.set_registered("feature-b", True)
 
         repo = Repository.discover(self.repository.root)
         node = repo.hierarchy().nodes[feature_b.id]
         self.assertEqual(feature_a.id, node.parent_id)
         self.assertEqual(["bridge"], node.skipped_parents)
 
-    def test_graphite_overrides_local_parent(self):
+    def test_explicit_parent_survives_parent_branch_advancing(self):
         repo = Repository.discover(self.repository.root)
         feature_a = repo.add_worktree("feature-a", "main")
         self.repository.add_commit(feature_a.path, "a.txt", "a\n")
         repo = Repository.discover(self.repository.root)
         feature_b = repo.add_worktree("feature-b", "feature-a")
-        repo.set_local_parent("feature-b", "main")
-        (self.repository.root / ".git" / ".graphite_repo_config").write_text(
-            json.dumps({"trunk": "main", "trunks": [{"name": "main"}]})
-        )
+        repo.set_registered("feature-a", True)
+        repo.set_registered("feature-b", True)
+        self.repository.add_commit(feature_a.path, "later.txt", "later\n")
 
-        runner = FakeGraphiteRunner(
-            {"main": None, "feature-a": "main", "feature-b": "feature-a"}
-        )
-        repo = Repository.discover(self.repository.root, runner)
+        repo = Repository.discover(self.repository.root)
         node = repo.hierarchy().nodes[feature_b.id]
-        self.assertEqual(ParentSource.GRAPHITE, node.source)
+        self.assertEqual(ParentSource.LOCAL, node.source)
         self.assertEqual(feature_a.id, node.parent_id)
 
-    def test_graphite_database_ignores_untracked_branch_rows(self):
+    def test_unregistered_branch_is_flat_without_persisting_parent(self):
+        git(self.repository.root, "branch", "parent", "main")
+        git(self.repository.root, "branch", "child", "parent")
         repo = Repository.discover(self.repository.root)
-        tracked = repo.add_worktree("tracked", "main")
-        repo = Repository.discover(self.repository.root)
-        untracked = repo.add_worktree("untracked", "main")
-        repo = Repository.discover(self.repository.root)
-        invalid = repo.add_worktree("invalid", "main")
-        common_dir = self.repository.root / ".git"
-        (common_dir / ".graphite_repo_config").write_text(
-            json.dumps({"trunk": "main", "trunks": [{"name": "main"}]})
-        )
-        connection = sqlite3.connect(common_dir / ".graphite_metadata.db")
-        connection.execute(
-            "CREATE TABLE branch_metadata "
-            "(branch_name TEXT, parent_branch_name TEXT, validation_result TEXT)"
-        )
-        connection.executemany(
-            "INSERT INTO branch_metadata VALUES (?, ?, ?)",
-            [
-                ("main", None, "TRUNK"),
-                ("tracked", "main", "VALID"),
-                ("untracked", None, "BAD_PARENT_NAME"),
-                ("invalid", "main", "BAD_PARENT_NAME"),
-            ],
-        )
-        connection.commit()
-        connection.close()
 
+        info = repo.parent_for_virtual_branch("child")
+
+        self.assertEqual("main", info.parent)
+        self.assertEqual(ParentSource.UNREGISTERED, info.source)
+        self.assertIsNone(repo.local_parent("child"))
+
+    def test_registered_pr_seed_imports_open_descendant_stack(self):
+        git(self.repository.root, "branch", "search", "main")
+        runner = FakeGitHubRunner(
+            [
+                {"number": 1, "title": "search", "headRefName": "search", "baseRefName": "main", "isDraft": True, "url": "https://example/1"},
+                {"number": 2, "title": "child", "headRefName": "search-child", "baseRefName": "search", "isDraft": False, "url": "https://example/2"},
+                {"number": 3, "title": "leaf", "headRefName": "search-leaf", "baseRefName": "search-child", "isDraft": False, "url": "https://example/3"},
+                {"number": 4, "title": "unrelated", "headRefName": "other", "baseRefName": "main", "isDraft": False, "url": "https://example/4"},
+            ]
+        )
+        repo = Repository.discover(self.repository.root, runner)
+        repo.set_registered("search", True)
+
+        registered = repo.github.registered_pull_requests()
+
+        self.assertEqual({"search", "search-child", "search-leaf"}, set(registered))
+        self.assertEqual(ParentSource.GITHUB, repo.parent_for_virtual_branch("search-leaf").source)
+        self.assertEqual("search-child", repo.parent_for_virtual_branch("search-leaf").parent)
+
+    def test_managed_pr_leaf_imports_ancestors_to_trunk(self):
         repo = Repository.discover(self.repository.root)
-        hierarchy = repo.hierarchy()
-        self.assertEqual(ParentSource.GRAPHITE, hierarchy.nodes[tracked.id].source)
-        self.assertEqual(ParentSource.LOCAL, hierarchy.nodes[untracked.id].source)
-        self.assertEqual(ParentSource.UNRESOLVED, hierarchy.nodes[invalid.id].source)
+        leaf = repo.add_worktree("search-leaf", "main")
+        runner = FakeGitHubRunner(
+            [
+                {"number": 1, "title": "root", "headRefName": "search-root", "baseRefName": "main", "isDraft": False, "url": "https://example/1"},
+                {"number": 2, "title": "child", "headRefName": "search-child", "baseRefName": "search-root", "isDraft": False, "url": "https://example/2"},
+                {"number": 3, "title": "leaf", "headRefName": "search-leaf", "baseRefName": "search-child", "isDraft": False, "url": "https://example/3"},
+                {"number": 4, "title": "other", "headRefName": "other", "baseRefName": "main", "isDraft": False, "url": "https://example/4"},
+            ]
+        )
+        repo = Repository.discover(self.repository.root, runner)
+
+        registered = repo.github.registered_pull_requests()
+
+        self.assertEqual({"search-root", "search-child", "search-leaf"}, set(registered))
+        self.assertEqual(leaf.id, repo.worktree_for_branch("search-leaf").id)
+
+    def test_involved_pr_imports_its_full_stack(self):
+        runner = FakeGitHubRunner(
+            [
+                {"number": 1, "title": "root", "headRefName": "search-root", "baseRefName": "main", "isDraft": False, "url": "https://example/1"},
+                {"number": 2, "title": "child", "headRefName": "search-child", "baseRefName": "search-root", "isDraft": False, "url": "https://example/2"},
+                {"number": 3, "title": "leaf", "headRefName": "search-leaf", "baseRefName": "search-child", "isDraft": False, "url": "https://example/3"},
+                {"number": 4, "title": "other", "headRefName": "other", "baseRefName": "main", "isDraft": False, "url": "https://example/4"},
+            ],
+            involved_heads={"search-child"},
+        )
+        repo = Repository.discover(self.repository.root, runner)
+
+        registered = repo.github.registered_pull_requests()
+
+        self.assertEqual({"search-root", "search-child", "search-leaf"}, set(registered))
+        self.assertEqual("search-root", repo.local_parent("search-child"))
+        self.assertIn("search-child", repo.registered_branches())
+
+    def test_registered_worktree_survives_pr_closure_as_local(self):
+        repo = Repository.discover(self.repository.root)
+        feature = repo.add_worktree("feature", "main")
+        runner = FakeGitHubRunner(
+            [
+                {"number": 1, "title": "feature", "headRefName": "feature", "baseRefName": "main", "isDraft": False, "url": "https://example/1"},
+            ],
+            involved_heads={"feature"},
+        )
+        open_repo = Repository.discover(self.repository.root, runner)
+        self.assertEqual(
+            ParentSource.GITHUB,
+            open_repo.hierarchy().nodes[feature.id].source,
+        )
+
+        closed_repo = Repository.discover(
+            self.repository.root,
+            FakeGitHubRunner([]),
+        )
+
+        self.assertEqual(
+            ParentSource.LOCAL,
+            closed_repo.hierarchy().nodes[feature.id].source,
+        )
+        self.assertIn("feature", closed_repo.registered_branches())
+
+    def test_global_parent_metadata_is_ignored(self):
+        config = Path(self.repository.tempdir.name) / "global.gitconfig"
+        config.write_text(
+            '[branch "feature"]\n\ttmux-worktrees-parent = unrelated\n'
+        )
+        repo = Repository.discover(
+            self.repository.root,
+            Runner({"GIT_CONFIG_GLOBAL": str(config)}),
+        )
+
+        self.assertIsNone(repo.local_parent("feature"))
 
     def test_remove_refuses_dirty_worktree(self):
         repo = Repository.discover(self.repository.root)
@@ -215,7 +270,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertFalse(feature.path.exists())
         self.assertTrue(repo.branch_exists("feature"))
 
-    def test_remove_can_preserve_inferred_parent_for_recovery(self):
+    def test_remove_does_not_persist_unregistered_parent(self):
         repo = Repository.discover(self.repository.root)
         feature = repo.add_worktree("feature", "main")
         git(self.repository.root, "config", "--unset", "branch.feature.tmux-worktrees-parent")
@@ -223,12 +278,12 @@ class RepositoryTests(unittest.TestCase):
         feature = repo.worktree_for_branch("feature")
         self.assertIsNotNone(feature)
         node = repo.hierarchy().nodes[feature.id]
-        self.assertEqual(ParentSource.INFERRED, node.source)
+        self.assertEqual(ParentSource.UNREGISTERED, node.source)
 
-        repo.remove_worktree(feature, preserve_parent=node.direct_parent)
+        repo.remove_worktree(feature)
 
         refreshed = Repository.discover(self.repository.root)
-        self.assertEqual("main", refreshed.local_parent("feature"))
+        self.assertIsNone(refreshed.local_parent("feature"))
         self.assertTrue(refreshed.branch_exists("feature"))
 
     def test_failed_remove_rolls_back_recovery_parent(self):

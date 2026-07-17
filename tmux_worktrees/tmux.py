@@ -203,51 +203,71 @@ class TmuxManager:
         return None
 
     def ensure_session(self, repo: Repository, worktree: Worktree) -> tuple[TmuxSession, bool]:
+        repo_lock_name = "tmux-worktrees-reconcile-" + hashlib.sha256(
+            str(repo.common_dir).encode()
+        ).hexdigest()[:16]
+        repo_lock_path = Path(tempfile.gettempdir()) / f"{repo_lock_name}.lock"
         lock_name = "tmux-worktrees-" + hashlib.sha256(
             f"{repo.common_dir}\0{worktree.path}".encode()
         ).hexdigest()[:16]
         lock_path = Path(tempfile.gettempdir()) / f"{lock_name}.lock"
-        with lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            server_running = self.is_running()
-            existing = self.find_session(repo, worktree) if server_running else None
-            if existing is not None:
-                return existing, False
-            if not worktree.path.exists():
-                raise RuntimeError(f"worktree path does not exist: {worktree.path}")
+        with repo_lock_path.open("a+") as repo_lock_file:
+            fcntl.flock(repo_lock_file.fileno(), fcntl.LOCK_EX)
+            expected_generation = repo.worktree_generation(worktree, create=False)
+            repo = Repository.discover(repo.root, repo.runner)
+            current_worktree = repo.managed_worktree(worktree.path)
+            if (
+                current_worktree is None
+                or current_worktree.branch != worktree.branch
+                or (
+                    expected_generation is not None
+                    and repo.worktree_generation(current_worktree, create=False)
+                    != expected_generation
+                )
+            ):
+                raise RuntimeError("worktree changed before session creation")
+            worktree = current_worktree
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                server_running = self.is_running()
+                existing = self.find_session(repo, worktree) if server_running else None
+                if existing is not None:
+                    return existing, False
+                if not worktree.path.exists():
+                    raise RuntimeError(f"worktree path does not exist: {worktree.path}")
 
-            name = self.available_name(repo, worktree)
-            result = self.run(
-                [
-                    "new-session",
-                    "-d",
-                    "-P",
-                    "-F",
-                    "#{session_id}",
-                    "-s",
-                    name,
-                    "-c",
-                    str(worktree.path),
-                ],
-                check=False,
-            )
-            if result.returncode != 0:
-                for _ in range(10):
-                    time.sleep(0.02)
-                    existing = self.lookup_session(repo, worktree)
-                    if existing is not None:
-                        return existing, False
-                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
-            session_id = result.stdout.strip()
-            try:
-                self.tag_session(session_id, repo, worktree)
-                created = next((item for item in self.sessions() if item.id == session_id), None)
-                if created is None:
-                    raise RuntimeError("tmux created a session but did not return it")
-                return created, True
-            except (RuntimeError, CommandError):
-                self.run(["kill-session", "-t", session_id], check=False)
-                raise
+                name = self.available_name(repo, worktree)
+                result = self.run(
+                    [
+                        "new-session",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{session_id}",
+                        "-s",
+                        name,
+                        "-c",
+                        str(worktree.path),
+                    ],
+                    check=False,
+                )
+                if result.returncode != 0:
+                    for _ in range(10):
+                        time.sleep(0.02)
+                        existing = self.lookup_session(repo, worktree)
+                        if existing is not None:
+                            return existing, False
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+                session_id = result.stdout.strip()
+                try:
+                    self.tag_session(session_id, repo, worktree)
+                    created = next((item for item in self.sessions() if item.id == session_id), None)
+                    if created is None:
+                        raise RuntimeError("tmux created a session but did not return it")
+                    return created, True
+                except (RuntimeError, CommandError):
+                    self.run(["kill-session", "-t", session_id], check=False)
+                    raise
 
     def tag_session(self, session_id: str, repo: Repository, worktree: Worktree) -> None:
         generation = repo.worktree_generation(worktree, create=True)
@@ -271,6 +291,28 @@ class TmuxManager:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             return self._reconcile_session_switch(repo, session_id)
 
+    def reconcile_repository_sessions(self, repo: Repository) -> Repository:
+        repo = Repository.discover(repo.root, repo.runner)
+        if not self.is_running():
+            return repo
+        grouped: dict[tuple[str, str], list[TmuxSession]] = {}
+        for session in self.sessions():
+            if (
+                session.repo == str(repo.common_dir)
+                and session.path
+                and session.generation
+            ):
+                grouped.setdefault((session.path, session.generation), []).append(session)
+
+        for sessions in grouped.values():
+            if len(sessions) != 1:
+                continue
+            session = sessions[0]
+            worktree = repo.managed_worktree(session.path or "")
+            if worktree is not None and worktree.branch != session.branch:
+                repo = self.reconcile_session_switch(repo, session.id)
+        return repo
+
     def _reconcile_session_switch(self, repo: Repository, session_id: str) -> Repository:
         repo = Repository.discover(repo.root, repo.runner)
         sessions = self.sessions()
@@ -285,7 +327,7 @@ class TmuxManager:
             return repo
 
         worktree = repo.managed_worktree(session.path)
-        if worktree is None or worktree.is_root or worktree.branch == session.branch:
+        if worktree is None or worktree.branch == session.branch:
             return repo
         if (
             worktree.branch is None
@@ -308,58 +350,88 @@ class TmuxManager:
 
         old_branch = session.branch
         new_branch = worktree.branch
-        if not repo.branch_exists(old_branch) or not repo.branch_exists(new_branch):
-            raise RuntimeError("branch disappeared during reconciliation")
-        if repo.worktree_for_branch(old_branch) is not None:
-            raise RuntimeError(f"branch {old_branch} is already checked out elsewhere")
+        if not repo.branch_exists(new_branch):
+            raise RuntimeError("checked-out branch disappeared during reconciliation")
+        target_sessions = [
+            item
+            for item in sessions
+            if item.id != session.id
+            and item.repo == session.repo
+            and item.branch == new_branch
+            and item.generation
+            and self._session_matches_anchor(repo, item)
+        ]
+        if target_sessions:
+            names = ", ".join(item.name for item in target_sessions)
+            raise RuntimeError(f"branch {new_branch} already has a tmux session: {names}")
 
-        old_tip = repo.branch_tip(old_branch)
-        new_tip = repo.branch_tip(new_branch)
-        new_info = repo.parent_for_virtual_branch(new_branch)
-        explicit_parent = new_info.source in {ParentSource.GRAPHITE, ParentSource.LOCAL}
-        based_on_old = (
-            new_info.parent == old_branch
-            if explicit_parent
-            else repo.branch_is_ancestor(old_branch, new_branch)
-        )
-        new_parent = (
-            new_info.parent
-            if explicit_parent and new_info.parent
-            else old_branch
-            if based_on_old
-            else repo.infer_parent(new_branch, allow_equal=True)
-            or repo.root_worktree.branch
-        )
-        if new_parent is None:
-            raise RuntimeError(f"cannot determine a parent for {new_branch}")
+        try:
+            refreshed = Repository.discover(repo.root, repo.runner)
+            current = refreshed.managed_worktree(worktree.path)
+            current_session = next(
+                (item for item in self.sessions() if item.id == session.id), None
+            )
+            if (
+                current is None
+                or current.branch != new_branch
+                or refreshed.worktree_generation(current, create=False)
+                != session.generation
+                or current_session != session
+            ):
+                raise RuntimeError("Git or tmux state changed during reconciliation")
+            retagged = self._retag_session_branch(session, refreshed, current)
+            try:
+                verified = Repository.discover(repo.root, repo.runner)
+                verified_worktree = verified.managed_worktree(worktree.path)
+                owners = [
+                    item
+                    for item in self.sessions()
+                    if item.repo == session.repo
+                    and item.path == session.path
+                    and item.generation == session.generation
+                ]
+                if (
+                    verified_worktree is None
+                    or verified_worktree.branch != new_branch
+                    or verified.worktree_generation(verified_worktree, create=False)
+                    != session.generation
+                    or len(owners) != 1
+                    or owners[0].id != session.id
+                ):
+                    raise RuntimeError(
+                        "worktree or session changed after reconciliation"
+                    )
+                return verified
+            except (CommandError, RuntimeError):
+                self._restore_retagged_session(retagged, session)
+                raise
+        except (CommandError, RuntimeError):
+            raise
 
-        if based_on_old or not repo.is_clean(worktree):
-            refreshed = self._keep_current_worktree_on_new_branch(
-                repo,
-                worktree,
-                session,
-                old_branch=old_branch,
-                new_branch=new_branch,
-                old_tip=old_tip,
-                new_tip=new_tip,
-                new_parent=new_parent,
-                persist_new_parent=new_info.source
-                not in {ParentSource.GRAPHITE, ParentSource.LOCAL},
-            )
-        else:
-            refreshed = self._restore_current_worktree_to_old_branch(
-                repo,
-                worktree,
-                session,
-                old_branch=old_branch,
-                new_branch=new_branch,
-                old_tip=old_tip,
-                new_tip=new_tip,
-                new_parent=new_parent,
-                persist_new_parent=new_info.source
-                not in {ParentSource.GRAPHITE, ParentSource.LOCAL},
-            )
-        return refreshed
+    def _session_matches_anchor(self, repo: Repository, session: TmuxSession) -> bool:
+        if not session.path or not session.generation:
+            return False
+        worktree = repo.managed_worktree(session.path)
+        return bool(
+            worktree is not None
+            and worktree.branch == session.branch
+            and repo.worktree_generation(worktree, create=False) == session.generation
+        )
+
+    def _explicit_parent_chain_contains(
+        self, repo: Repository, branch: str, target: str
+    ) -> bool:
+        visited: set[str] = set()
+        current = branch
+        while current and current not in visited:
+            if current == target:
+                return True
+            visited.add(current)
+            info = repo.parent_for_virtual_branch(current)
+            if info.source != ParentSource.LOCAL:
+                return False
+            current = info.parent or ""
+        return current == target
 
     def _keep_current_worktree_on_new_branch(
         self,
@@ -377,25 +449,18 @@ class TmuxManager:
         old_info = repo.parent_for_virtual_branch(old_branch)
         old_parent = old_info.parent or repo.root_worktree.branch
         if old_parent == new_branch:
-            if old_info.source in {ParentSource.GRAPHITE, ParentSource.LOCAL}:
+            if old_info.source == ParentSource.LOCAL:
                 raise RuntimeError(
                     f"existing metadata would create a parent cycle: {old_branch} -> {new_branch}"
                 )
             old_parent = (
-                repo.infer_parent(
-                    old_branch,
-                    allow_equal=True,
-                    exclude_branches={new_branch},
-                )
+                repo.trunk_branch
                 or repo.root_worktree.branch
             )
         if old_parent is None:
             raise RuntimeError(f"cannot determine a parent for {old_branch}")
         metadata_added = persist_new_parent and repo.local_parent(new_branch) is None
-        persist_old_parent = old_info.source not in {
-            ParentSource.GRAPHITE,
-            ParentSource.LOCAL,
-        }
+        persist_old_parent = old_info.source != ParentSource.LOCAL
         old_metadata_added = persist_old_parent and repo.local_parent(old_branch) is None
         if metadata_added:
             repo.set_local_parent(new_branch, new_parent)
@@ -640,7 +705,7 @@ class TmuxManager:
         current = next((item for item in self.sessions() if item.id == expected.id), None)
         if current != expected or worktree.branch is None:
             raise RuntimeError("tmux session changed during reconciliation")
-        new_name = self.available_name(repo, worktree)
+        new_name = expected.name if worktree.is_root else self.available_name(repo, worktree)
         branch_changed = False
         renamed = False
         try:
@@ -816,6 +881,7 @@ class TmuxManager:
     ) -> tuple[TmuxSession, Worktree]:
         if root_session_name:
             self.register_root_session(repo, root_session_name)
+        repo = self.reconcile_repository_sessions(repo)
         worktree = self.last_worktree(repo)
         session, _ = self.ensure_session(repo, worktree)
         self.switch_worktree(repo, worktree, session)

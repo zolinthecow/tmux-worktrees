@@ -13,10 +13,10 @@ from .tmux import TmuxManager
 EXPECTED_KEYS = {
     "enter",
     "ctrl-a",
-    "ctrl-t",
+    "ctrl-g",
     "ctrl-p",
     "ctrl-x",
-    "alt-x",
+    "ctrl-d",
     "ctrl-b",
     "ctrl-r",
 }
@@ -50,11 +50,10 @@ class _DisplayNode:
 def source_badge(source: ParentSource) -> str:
     return {
         ParentSource.ROOT: " ",
-        ParentSource.GRAPHITE: "G",
+        ParentSource.GITHUB: "P",
         ParentSource.LOCAL: "L",
-        ParentSource.INFERRED: "?",
+        ParentSource.UNREGISTERED: "U",
         ParentSource.DETACHED: "D",
-        ParentSource.UNRESOLVED: "!",
     }[source]
 
 
@@ -70,7 +69,10 @@ def _hierarchy_rows(
         if (
             not include_inactive
             and not node.worktree.is_root
-            and (not node.worktree.path.exists() or node.worktree.prunable is not None)
+            and (
+                not node.worktree.path.exists()
+                or node.worktree.prunable is not None
+            )
         ):
             continue
         display_nodes[node_id] = _DisplayNode(
@@ -148,8 +150,8 @@ def _hierarchy_rows(
         for node_id, node in hierarchy.nodes.items()
         if node.worktree.branch is not None
     }
-    graphite_parents = repo.graphite.tracked_parents() if include_inactive else {}
-    for branch, parent in graphite_parents.items():
+    registered_pull_requests = repo.github.registered_pull_requests()
+    for branch, pull_request in registered_pull_requests.items():
         if branch in managed_by_branch:
             continue
         virtual_id = f"branch:{branch}"
@@ -158,32 +160,61 @@ def _hierarchy_rows(
                 id=virtual_id,
                 label=branch,
                 parent_id=None,
-                source=ParentSource.GRAPHITE,
+                source=ParentSource.GITHUB,
                 picker_node=VirtualBranchNode(
                     branch=branch,
-                    direct_parent=parent,
-                    source=ParentSource.GRAPHITE,
+                    direct_parent=pull_request.base,
+                    source=ParentSource.GITHUB,
                     warnings=external_warnings(branch),
                     external_path=external_by_branch.get(branch),
                 ),
             )
 
-    local_parents = repo.local_parents() if include_inactive else {}
-    for branch, parent in local_parents.items():
+    if include_inactive:
+        for branch, pull_request in repo.github.pull_requests().items():
+            if branch in registered_pull_requests or branch in managed_by_branch:
+                continue
+            virtual_id = f"branch:{branch}"
+            if virtual_id not in display_nodes:
+                display_nodes[virtual_id] = _DisplayNode(
+                    id=virtual_id,
+                    label=branch,
+                    parent_id=None,
+                    source=ParentSource.UNREGISTERED,
+                    picker_node=VirtualBranchNode(
+                        branch=branch,
+                        direct_parent=repo.trunk_branch,
+                        source=ParentSource.UNREGISTERED,
+                        warnings=("open PR is not registered; use ctrl-g to import it",)
+                        + external_warnings(branch),
+                        external_path=external_by_branch.get(branch),
+                    ),
+                )
+
+    local_branches = {
+        branch: ""
+        for branch in repo.registered_branches()
+        if repo.branch_exists(branch)
+    }
+    if include_inactive:
+        local_branches.update(repo.local_branch_tips())
+    for branch in local_branches:
         if branch in managed_by_branch:
             continue
         virtual_id = f"branch:{branch}"
         if virtual_id not in display_nodes:
+            info = repo.parent_for_virtual_branch(branch)
+            warnings = (info.warning,) if info.warning else ()
             display_nodes[virtual_id] = _DisplayNode(
                 id=virtual_id,
                 label=branch,
                 parent_id=None,
-                source=ParentSource.LOCAL,
+                source=info.source,
                 picker_node=VirtualBranchNode(
                     branch=branch,
-                    direct_parent=parent,
-                    source=ParentSource.LOCAL,
-                    warnings=external_warnings(branch),
+                    direct_parent=info.parent,
+                    source=info.source,
+                    warnings=warnings + external_warnings(branch),
                     external_path=external_by_branch.get(branch),
                 ),
             )
@@ -195,23 +226,16 @@ def _hierarchy_rows(
             virtual_id = f"branch:{branch}"
             if virtual_id in display_nodes:
                 continue
-            parent = (
-                repo.infer_parent(
-                    branch,
-                    allow_equal=True,
-                    include_external=True,
-                )
-                or repo.root_worktree.branch
-            )
+            parent = repo.trunk_branch
             display_nodes[virtual_id] = _DisplayNode(
                 id=virtual_id,
                 label=branch,
                 parent_id=None,
-                source=ParentSource.INFERRED,
+                source=ParentSource.UNREGISTERED,
                 picker_node=VirtualBranchNode(
                     branch=branch,
                     direct_parent=parent,
-                    source=ParentSource.INFERRED,
+                    source=ParentSource.UNREGISTERED,
                     warnings=external_warnings(branch),
                     external_path=path,
                 ),
@@ -420,14 +444,8 @@ class Picker:
     def run(self) -> None:
         include_inactive = False
         while True:
-            current_session_id = self.tmux.current_session_id()
             try:
-                if current_session_id is not None:
-                    self.repo = self.tmux.reconcile_session_switch(
-                        self.repo, current_session_id
-                    )
-                else:
-                    self.repo = Repository.discover(self.repo.root, self.runner)
+                self.repo = self.tmux.reconcile_repository_sessions(self.repo)
             except (RuntimeError, CommandError) as error:
                 self._pause(f"Error reconciling branch switch: {error}")
                 return
@@ -490,7 +508,7 @@ class Picker:
             "--expect=" + ",".join(sorted(EXPECTED_KEYS)),
             "--header=enter open | ctrl-a add | ctrl-b "
             + ("active only" if include_inactive else "show inactive")
-            + " | ctrl-x deactivate | alt-x delete | ctrl-r refresh",
+            + " | ctrl-g register PR | ctrl-p reparent | ctrl-x deactivate | ctrl-d delete | ctrl-r refresh",
             "--preview",
             preview,
             "--preview-window=right,55%,wrap",
@@ -522,6 +540,9 @@ class Picker:
         if isinstance(node, VirtualBranchNode):
             if key == "enter":
                 return self._open_virtual_branch(node)
+            if key == "ctrl-g":
+                self._register_branch(node.branch, node.direct_parent)
+                return False
             raise RuntimeError(
                 f"{node.branch} has no managed worktree; press Enter to create and open it"
             )
@@ -535,19 +556,22 @@ class Picker:
             return True
         if key == "ctrl-a":
             return self._add(node)
-        if key == "ctrl-t":
-            self._track(node)
+        if key == "ctrl-g":
+            self._register_branch(node.worktree.branch, node.direct_parent)
             return False
         if key == "ctrl-p":
             self._reparent(node, hierarchy)
             return False
         if key == "ctrl-x":
             return self._remove(node, hierarchy, delete_branch=False)
-        if key == "alt-x":
+        if key == "ctrl-d":
             return self._remove(node, hierarchy, delete_branch=True)
         return False
 
     def _open_virtual_branch(self, node: VirtualBranchNode) -> bool:
+        pull_request = self.repo.github.pull_requests().get(node.branch)
+        if pull_request is not None and not self.repo.branch_exists(node.branch):
+            self.repo.ensure_local_branch(node.branch, pull_request=pull_request.number)
         if not self.repo.branch_exists(node.branch):
             raise RuntimeError(f"branch no longer exists: {node.branch}")
         existing = self.repo.worktree_for_branch(node.branch)
@@ -566,7 +590,7 @@ class Picker:
         worktree = self.repo.add_existing_worktree(
             node.branch,
             parent,
-            persist_parent=node.source not in {ParentSource.GRAPHITE, ParentSource.LOCAL},
+            persist_parent=False,
         )
         refreshed = Repository.discover(worktree.path, self.runner)
         managed = refreshed.managed_worktree(worktree.path)
@@ -590,6 +614,19 @@ class Picker:
             raise
         return True
 
+    def _register_branch(self, branch: str | None, parent: str | None) -> None:
+        if branch is None:
+            raise RuntimeError("detached worktrees cannot be registered")
+        if branch == self.repo.trunk_branch:
+            raise RuntimeError("the trunk branch is already registered")
+        parent = parent or self.repo.trunk_branch
+        if parent is None:
+            raise RuntimeError("select a parent before registering this branch")
+        if not self._confirm(f"Register {branch} onto {parent} with a draft GitHub PR?"):
+            return
+        pull_request = self.repo.github.register(branch, parent)
+        self._pause(f"Registered PR #{pull_request.number}: {pull_request.url}")
+
     def _add(self, parent_node: HierarchyNode) -> bool:
         parent = parent_node.worktree
         if parent.branch is None:
@@ -612,6 +649,7 @@ class Picker:
         parent_node, _ = self._refresh_selected(parent_node, exact=True)
         parent = parent_node.worktree
         worktree = self.repo.add_worktree(branch, parent.branch)
+        self.repo.register_local(branch, parent.branch)
         refreshed = Repository.discover(worktree.path, self.runner)
         managed = refreshed.managed_worktree(worktree.path)
         if managed is None:
@@ -620,56 +658,12 @@ class Picker:
         self.tmux.switch_worktree(refreshed, managed, session)
         return True
 
-    def _track(self, node: HierarchyNode) -> None:
-        worktree = node.worktree
-        if worktree.branch is None:
-            raise RuntimeError("detached worktrees cannot be tracked by Graphite")
-        if node.source == ParentSource.GRAPHITE:
-            self._pause(f"{worktree.branch} is already tracked by Graphite.")
-            return
-        if not node.direct_parent:
-            raise RuntimeError("select a local parent before tracking this branch")
-        if not self.repo.graphite.configured:
-            raise RuntimeError("Graphite is not initialized in this repository; run gt init first")
-        print(f"Track {worktree.branch} on top of {node.direct_parent} with Graphite.")
-        if not self._confirm("Continue?"):
-            return
-        node, _ = self._refresh_selected(node, exact=True)
-        worktree = node.worktree
-        if node.source == ParentSource.GRAPHITE:
-            raise RuntimeError("branch became Graphite-tracked while the picker was open")
-        self.repo.graphite.require_supported_version()
-        result = self.runner.run(
-            [
-                "gt",
-                "track",
-                worktree.branch,
-                "--parent",
-                node.direct_parent,
-                "--cwd",
-                str(worktree.path),
-                "--no-interactive",
-            ],
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
-        self._pause(result.stdout.strip() or f"Tracked {worktree.branch}.")
-
     def _reparent(self, node: HierarchyNode, hierarchy: Hierarchy) -> None:
         worktree = node.worktree
         if worktree.is_root:
             raise RuntimeError("the main worktree cannot be reparented")
         if worktree.branch is None:
             raise RuntimeError("detached worktrees cannot be reparented")
-        if node.source == ParentSource.GRAPHITE:
-            raise RuntimeError(
-                f"run `gt move --source {worktree.branch} --onto <parent>` manually; "
-                "the picker will refresh Graphite metadata afterward"
-            )
-        if node.source == ParentSource.UNRESOLVED:
-            raise RuntimeError("Graphite state is unresolved; reparenting is disabled")
-
         descendants = self._descendants(hierarchy, worktree.id)
         candidates = [
             item
@@ -699,7 +693,11 @@ class Picker:
         node, _ = self._refresh_selected(node, exact=True)
         if not any(item.branch == parent for item in self.repo.managed_worktrees):
             raise RuntimeError(f"selected parent is no longer available: {parent}")
-        self.repo.set_local_parent(worktree.branch, parent)
+        pull_request = self.repo.github.registered_pull_requests().get(worktree.branch)
+        if pull_request is not None:
+            self.repo.github.reparent(pull_request, parent)
+        else:
+            self.repo.register_local(worktree.branch, parent)
 
     def _remove(
         self,
@@ -715,12 +713,6 @@ class Picker:
             raise RuntimeError(
                 "detached worktrees cannot be deactivated safely; create a branch for this commit first"
             )
-        if delete_branch and node.source == ParentSource.GRAPHITE:
-            raise RuntimeError(
-                "remove the checkout with ctrl-x, then run gt delete manually from another worktree"
-            )
-        if delete_branch and node.source == ParentSource.UNRESOLVED:
-            raise RuntimeError("Graphite state is unresolved; refusing to choose a branch deletion strategy")
         if not self.repo.is_clean(worktree):
             raise RuntimeError("worktree is dirty; commit, stash, or clean it before removal")
 
@@ -780,7 +772,9 @@ class Picker:
         self.repo.remove_worktree(
             worktree,
             confirmed_ignored=ignored_snapshot,
-            preserve_parent=node.direct_parent or self.repo.root_worktree.branch,
+            preserve_parent=(
+                node.direct_parent if node.source == ParentSource.LOCAL else None
+            ),
         )
 
         branch_error: str | None = None
@@ -859,7 +853,10 @@ class Picker:
         if managed is not None and managed.id in hierarchy.nodes:
             self.repo = refreshed
             return hierarchy.nodes[managed.id], hierarchy
-        if not refreshed.branch_exists(node.branch):
+        if (
+            not refreshed.branch_exists(node.branch)
+            and node.branch not in refreshed.github.pull_requests()
+        ):
             raise RuntimeError(f"branch no longer exists: {node.branch}")
         for _, candidate in render_hierarchy(
             refreshed, hierarchy, include_inactive=True
@@ -946,7 +943,8 @@ def preview(repo_root: Path, worktree_path: Path, runner: Runner | None = None) 
 def preview_branch(repo_root: Path, branch: str, runner: Runner | None = None) -> str:
     runner = runner or Runner()
     repo = Repository.discover(repo_root, runner)
-    if not repo.branch_exists(branch):
+    pull_request = repo.github.registered_pull_requests().get(branch)
+    if not repo.branch_exists(branch) and pull_request is None:
         return f"Branch no longer exists\n{branch}"
     info = repo.parent_for_virtual_branch(branch)
     existing = repo.worktree_for_branch(branch)
@@ -980,6 +978,14 @@ def preview_branch(repo_root: Path, branch: str, runner: Runner | None = None) -
             else "Press Enter to create its worktree and open a tmux session."
         ),
     ]
+    if pull_request is not None:
+        lines.extend(
+            [
+                "",
+                f"GitHub PR: #{pull_request.number} ({'draft' if pull_request.draft else 'open'})",
+                pull_request.url,
+            ]
+        )
     if info.warning:
         lines.append(f"Warning: {info.warning}")
     log = repo.git(["log", "-1", "--format=%h %s (%ar)", branch], check=False)
@@ -991,10 +997,6 @@ def preview_branch(repo_root: Path, branch: str, runner: Runner | None = None) -
 def doctor(repo: Repository, tmux: TmuxManager | None = None) -> list[str]:
     issues: list[str] = []
     hierarchy = repo.hierarchy()
-    if repo.graphite.trunks() and repo.root_worktree.branch not in repo.graphite.trunks():
-        issues.append(
-            f"main checkout is {repo.root_worktree.branch}; Graphite trunk is {', '.join(repo.graphite.trunks())}"
-        )
     if repo.managed_directory_is_internal:
         ignored = repo.git(["check-ignore", "--quiet", str(repo.worktrees_dir)], check=False)
         if ignored.returncode != 0:
@@ -1009,8 +1011,6 @@ def doctor(repo: Repository, tmux: TmuxManager | None = None) -> list[str]:
             issues.append(f"prunable worktree: {worktree.path}")
         elif not worktree.path.exists():
             issues.append(f"missing worktree path: {worktree.path}")
-        if node.source == ParentSource.INFERRED and not worktree.is_root:
-            issues.append(f"inferred parent for {worktree.label}: {node.direct_parent or 'none'}")
         issues.extend(f"{worktree.label}: {warning}" for warning in node.warnings)
     managed_ids = {item.id for item in repo.managed_worktrees}
     for worktree in repo.external_worktrees:

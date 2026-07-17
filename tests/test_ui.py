@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import sqlite3
 import unittest
 import uuid
+from unittest import mock
 
-from tests.test_model import FakeGraphiteRunner, TemporaryRepository, git
+from tests.test_model import FakeGitHubRunner, TemporaryRepository, git
 from tmux_worktrees.model import ParentSource, Repository
 from tmux_worktrees.tmux import TmuxManager
 from tmux_worktrees.ui import (
@@ -25,44 +25,28 @@ class VirtualBranchTests(unittest.TestCase):
     def tearDown(self):
         self.repository.close()
 
-    def configure_graphite(self, rows: list[tuple[str, str | None, str]]) -> None:
-        common_dir = self.repository.root / ".git"
-        (common_dir / ".graphite_repo_config").write_text(
-            json.dumps({"trunk": "main", "trunks": [{"name": "main"}]})
-        )
-        connection = sqlite3.connect(common_dir / ".graphite_metadata.db")
-        connection.execute(
-            "CREATE TABLE branch_metadata "
-            "(branch_name TEXT, parent_branch_name TEXT, validation_result TEXT)"
-        )
-        connection.executemany("INSERT INTO branch_metadata VALUES (?, ?, ?)", rows)
-        connection.commit()
-        connection.close()
-
-    def test_render_includes_branch_only_parent_and_unchecked_graphite_branch(self):
+    def test_render_includes_explicit_branch_only_stack(self):
         git(self.repository.root, "branch", "parent", "main")
         git(self.repository.root, "branch", "child", "parent")
         git(self.repository.root, "branch", "other-stack", "main")
         repo = Repository.discover(self.repository.root)
         repo.add_worktree("child", "parent")
-        self.configure_graphite(
-            [
-                ("main", None, "TRUNK"),
-                ("parent", "main", "VALID"),
-                ("child", "parent", "VALID"),
-                ("other-stack", "main", "VALID"),
-            ]
-        )
+        repo.set_local_parent("parent", "main")
+        repo.set_local_parent("child", "parent")
+        repo.set_local_parent("other-stack", "main")
+        repo.set_registered("parent", True)
+        repo.set_registered("child", True)
+        repo.set_registered("other-stack", True)
         repo = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
         displays = [display for display, _ in rows]
-        parent_index = next(index for index, value in enumerate(displays) if "parent  [G branch]" in value)
-        child_index = next(index for index, value in enumerate(displays) if "child  [G]" in value)
+        parent_index = next(index for index, value in enumerate(displays) if "parent  [L branch]" in value)
+        child_index = next(index for index, value in enumerate(displays) if "child  [L]" in value)
 
         self.assertLess(parent_index, child_index)
         self.assertIn("└─ child", displays[child_index])
-        self.assertTrue(any("other-stack  [G branch]" in value for value in displays))
+        self.assertTrue(any("other-stack  [L branch]" in value for value in displays))
         parent_node = rows[parent_index][1]
         self.assertIsInstance(parent_node, VirtualBranchNode)
         self.assertEqual("main", parent_node.direct_parent)
@@ -99,6 +83,22 @@ class VirtualBranchTests(unittest.TestCase):
         self.assertFalse(any("inactive" in display for display, _ in rows))
         self.assertEqual(1, len(rows))
 
+    def test_active_unregistered_worktree_remains_visible(self):
+        repo = Repository.discover(self.repository.root)
+        worktree = repo.add_worktree("feature", "main")
+        repo.unset_local_parent("feature")
+        repo = Repository.discover(self.repository.root)
+
+        rows = render_hierarchy(repo, repo.hierarchy())
+
+        self.assertTrue(
+            any(
+                node.worktree.id == worktree.id and "feature  [U]" in display
+                for display, node in rows
+                if hasattr(node, "worktree")
+            )
+        )
+
     def test_default_render_keeps_inactive_bridge_between_active_worktrees(self):
         git(self.repository.root, "branch", "bridge", "main")
         git(self.repository.root, "branch", "child", "bridge")
@@ -106,6 +106,8 @@ class VirtualBranchTests(unittest.TestCase):
         child = repo.add_worktree("child", "bridge")
         repo.set_local_parent("bridge", "main")
         repo.set_local_parent("child", "bridge")
+        repo.set_registered("bridge", True)
+        repo.set_registered("child", True)
         repo = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(repo, repo.hierarchy())
@@ -194,20 +196,53 @@ class VirtualBranchTests(unittest.TestCase):
         tmux.switch_worktree = record_switch
         try:
             Picker(repo, tmux=tmux)._open_virtual_branch(
-                VirtualBranchNode("parent", "main", ParentSource.GRAPHITE)
+                VirtualBranchNode("parent", "main", ParentSource.UNREGISTERED)
             )
             refreshed = Repository.discover(self.repository.root)
             worktree = refreshed.worktree_for_branch("parent")
             self.assertIsNotNone(worktree)
             self.assertIsNotNone(refreshed.managed_worktree(worktree.path))
+            self.assertIsNone(refreshed.local_parent("parent"))
             self.assertEqual(1, len(switched))
         finally:
             tmux.switch_worktree = original_switch
             tmux.run(["kill-server"], check=False)
 
+    def test_registered_pr_seed_renders_remote_descendants(self):
+        repo = Repository.discover(self.repository.root)
+        search = repo.add_worktree("search", "main")
+        repo.set_registered("search", True)
+        runner = FakeGitHubRunner(
+            [
+                {"number": 1, "title": "search", "headRefName": "search", "baseRefName": "main", "isDraft": True, "url": "https://example/1"},
+                {"number": 2, "title": "child", "headRefName": "search-child", "baseRefName": "search", "isDraft": False, "url": "https://example/2"},
+                {"number": 3, "title": "leaf", "headRefName": "search-leaf", "baseRefName": "search-child", "isDraft": False, "url": "https://example/3"},
+                {"number": 4, "title": "other", "headRefName": "other", "baseRefName": "main", "isDraft": False, "url": "https://example/4"},
+            ]
+        )
+        repo = Repository.discover(self.repository.root, runner)
+
+        displays = [display for display, _ in render_hierarchy(repo, repo.hierarchy())]
+
+        self.assertTrue(any("search  [P]" in display for display in displays))
+        self.assertTrue(any("search-child  [P branch]" in display for display in displays))
+        self.assertTrue(any("search-leaf  [P branch]" in display for display in displays))
+        self.assertFalse(any("other" in display for display in displays))
+        self.assertIsNotNone(repo.managed_worktree(search.path))
+
+        all_rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
+        other = next(
+            node
+            for _, node in all_rows
+            if isinstance(node, VirtualBranchNode) and node.branch == "other"
+        )
+        refreshed, _ = Picker(repo)._refresh_picker_node(other, exact=False)
+        self.assertEqual("other", refreshed.branch)
+
     def test_removed_local_worktree_remains_as_branch_only_node(self):
         repo = Repository.discover(self.repository.root)
         worktree = repo.add_worktree("local-feature", "main")
+        repo.set_registered("local-feature", True)
         repo = Repository.discover(self.repository.root)
         worktree = repo.managed_worktree(worktree.path)
         self.assertIsNotNone(worktree)
@@ -215,9 +250,13 @@ class VirtualBranchTests(unittest.TestCase):
         refreshed = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
+        default_rows = render_hierarchy(refreshed, refreshed.hierarchy())
 
         self.assertTrue(
             any("local-feature  [L branch]" in display for display, _ in rows)
+        )
+        self.assertTrue(
+            any("local-feature  [L branch]" in display for display, _ in default_rows)
         )
 
     def test_disappearing_virtual_branch_is_not_recreated(self):
@@ -262,6 +301,9 @@ class VirtualBranchTests(unittest.TestCase):
         repo.set_local_parent("a", "b")
         repo.set_local_parent("b", "a")
         repo.set_local_parent("child", "a")
+        repo.set_registered("a", True)
+        repo.set_registered("b", True)
+        repo.set_registered("child", True)
         refreshed = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
@@ -275,6 +317,7 @@ class VirtualBranchTests(unittest.TestCase):
         external_path = self.repository.root.parent / "external"
         git(self.repository.root, "branch", "external", "main")
         git(self.repository.root, "config", "branch.external.tmux-worktrees-parent", "main")
+        git(self.repository.root, "config", "branch.external.tmux-worktrees-registered", "true")
         git(self.repository.root, "worktree", "add", str(external_path), "external")
         repo = Repository.discover(self.repository.root)
 
@@ -307,7 +350,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            any("ordinary-external  [? external]" in display for display, _ in rows)
+            any("ordinary-external  [U external]" in display for display, _ in rows)
         )
         external_node = next(
             node
@@ -315,7 +358,7 @@ class VirtualBranchTests(unittest.TestCase):
             if isinstance(node, VirtualBranchNode)
             and node.branch == "ordinary-external"
         )
-        self.assertEqual("managed-parent", external_node.direct_parent)
+        self.assertEqual("main", external_node.direct_parent)
         self.assertTrue(
             any(
                 item["kind"] == "external"
@@ -324,7 +367,7 @@ class VirtualBranchTests(unittest.TestCase):
             )
         )
 
-    def test_external_stack_preserves_external_parent(self):
+    def test_unregistered_external_stack_is_flat(self):
         parent_path = self.repository.root.parent / "external-parent"
         child_path = self.repository.root.parent / "external-child"
         git(self.repository.root, "branch", "external-parent", "main")
@@ -348,8 +391,8 @@ class VirtualBranchTests(unittest.TestCase):
             item for item in recovery_json if item["branch"] == "external-child"
         )
 
-        self.assertEqual("external-parent", child.direct_parent)
-        self.assertEqual("branch:external-parent", child_json["visible_parent_id"])
+        self.assertEqual("main", child.direct_parent)
+        self.assertEqual(str(self.repository.root.resolve()), child_json["visible_parent_id"])
 
     def test_missing_locked_external_is_warned_and_diagnosed(self):
         external_path = self.repository.root.parent / "locked-external"
@@ -366,7 +409,7 @@ class VirtualBranchTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            any("locked-external  [? external] !" in display for display, _ in rows)
+            any("locked-external  [U external] !" in display for display, _ in rows)
         )
         self.assertTrue(
             any("missing external worktree" in issue and "locked-external" in issue for issue in issues)
@@ -416,38 +459,31 @@ class VirtualBranchTests(unittest.TestCase):
         refreshed = Repository.discover(self.repository.root)
         self.assertIsNone(refreshed.worktree_for_branch("locked"))
 
-    def test_graphite_cli_fallback_discovers_branch_only_nodes(self):
+    def test_unregistered_branch_is_shown_flat(self):
         git(self.repository.root, "branch", "stack-only", "main")
-        common_dir = self.repository.root / ".git"
-        (common_dir / ".graphite_repo_config").write_text(
-            json.dumps({"trunk": "main", "trunks": [{"name": "main"}]})
-        )
-        runner = FakeGraphiteRunner({"main": None, "stack-only": "main"})
-        repo = Repository.discover(self.repository.root, runner)
+        repo = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
 
         self.assertTrue(
-            any("stack-only  [G branch]" in display for display, _ in rows)
+            any("stack-only  [U branch]" in display for display, _ in rows)
         )
 
-    def test_graphite_cli_fallback_preserves_parentheses_in_branch_name(self):
+    def test_unregistered_branch_preserves_parentheses_in_branch_name(self):
         branch = "feat(test)"
         git(self.repository.root, "branch", branch, "main")
-        common_dir = self.repository.root / ".git"
-        (common_dir / ".graphite_repo_config").write_text(
-            json.dumps({"trunk": "main", "trunks": [{"name": "main"}]})
-        )
-        runner = FakeGraphiteRunner({"main": None, branch: "main"})
-        repo = Repository.discover(self.repository.root, runner)
+        repo = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
 
-        self.assertTrue(any(f"{branch}  [G branch]" in display for display, _ in rows))
+        self.assertTrue(any(f"{branch}  [U branch]" in display for display, _ in rows))
 
-    def test_stale_graphite_metadata_branch_is_not_rendered(self):
-        self.configure_graphite(
-            [("main", None, "TRUNK"), ("stale", "main", "VALID")]
+    def test_stale_local_metadata_branch_is_not_rendered(self):
+        git(
+            self.repository.root,
+            "config",
+            "branch.stale.tmux-worktrees-parent",
+            "main",
         )
         repo = Repository.discover(self.repository.root)
 
@@ -455,17 +491,11 @@ class VirtualBranchTests(unittest.TestCase):
 
         self.assertFalse(any("stale" in display for display, _ in rows))
 
-    def test_stale_graphite_parent_of_managed_child_is_not_rendered(self):
+    def test_stale_explicit_parent_of_managed_child_is_not_rendered(self):
         git(self.repository.root, "branch", "child", "main")
         repo = Repository.discover(self.repository.root)
         repo.add_worktree("child", "main")
-        self.configure_graphite(
-            [
-                ("main", None, "TRUNK"),
-                ("stale-parent", "main", "VALID"),
-                ("child", "stale-parent", "VALID"),
-            ]
-        )
+        repo.set_local_parent("child", "stale-parent")
         refreshed = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(refreshed, refreshed.hierarchy(), include_inactive=True)
@@ -482,11 +512,17 @@ class VirtualBranchTests(unittest.TestCase):
             "branch.child.tmux-worktrees-parent",
             "parent",
         )
+        git(
+            self.repository.root,
+            "config",
+            "branch.child.tmux-worktrees-registered",
+            "true",
+        )
         repo = Repository.discover(self.repository.root)
 
         rows = render_hierarchy(repo, repo.hierarchy(), include_inactive=True)
         displays = [display for display, _ in rows]
-        parent_index = next(index for index, value in enumerate(displays) if "parent  [L branch]" in value)
+        parent_index = next(index for index, value in enumerate(displays) if "parent  [U branch]" in value)
         child_index = next(index for index, value in enumerate(displays) if "child  [L branch]" in value)
 
         self.assertLess(parent_index, child_index)

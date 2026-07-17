@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -13,17 +12,15 @@ from pathlib import Path
 from .process import CommandError, Runner
 
 
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 IgnoredSnapshot = tuple[tuple[str, str, int, int], ...]
 
 
 class ParentSource(str, Enum):
     ROOT = "root"
-    GRAPHITE = "graphite"
+    GITHUB = "github"
     LOCAL = "local"
-    INFERRED = "inferred"
+    UNREGISTERED = "unregistered"
     DETACHED = "detached"
-    UNRESOLVED = "unresolved"
 
 
 @dataclass(frozen=True)
@@ -50,6 +47,184 @@ class ParentInfo:
     parent: str | None
     source: ParentSource
     warning: str | None = None
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    head: str
+    base: str
+    title: str
+    url: str
+    draft: bool
+
+
+class GitHubProvider:
+    def __init__(self, repo: Repository):
+        self.repo = repo
+        self._pull_requests: dict[str, PullRequest] | None = None
+        self._involved_branches: set[str] | None = None
+        self.error: str | None = None
+
+    def pull_requests(self, *, force: bool = False) -> dict[str, PullRequest]:
+        if self._pull_requests is not None and not force:
+            return self._pull_requests
+        result = self.repo.runner.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,headRefName,baseRefName,isDraft,url",
+            ],
+            cwd=self.repo.root,
+            check=False,
+        )
+        if result.returncode != 0:
+            self.error = result.stderr.strip() or result.stdout.strip() or "GitHub PR lookup failed"
+            self._pull_requests = {}
+            return self._pull_requests
+        try:
+            rows = json.loads(result.stdout)
+            self._pull_requests = {
+                row["headRefName"]: PullRequest(
+                    number=int(row["number"]),
+                    head=row["headRefName"],
+                    base=row["baseRefName"],
+                    title=row["title"],
+                    url=row["url"],
+                    draft=bool(row["isDraft"]),
+                )
+                for row in rows
+            }
+            self.error = None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self.error = f"invalid GitHub PR response: {error}"
+            self._pull_requests = {}
+        return self._pull_requests
+
+    def involved_branches(self) -> set[str]:
+        if self._involved_branches is not None:
+            return self._involved_branches
+        result = self.repo.runner.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--search",
+                "involves:@me",
+                "--json",
+                "headRefName",
+            ],
+            cwd=self.repo.root,
+            check=False,
+        )
+        if result.returncode != 0:
+            self._involved_branches = set()
+            return self._involved_branches
+        try:
+            rows = json.loads(result.stdout)
+            self._involved_branches = {row["headRefName"] for row in rows}
+        except (KeyError, TypeError, json.JSONDecodeError):
+            self._involved_branches = set()
+        return self._involved_branches
+
+    def registered_pull_requests(self) -> dict[str, PullRequest]:
+        registered = self.repo.registered_branches()
+        pull_requests = self.pull_requests()
+        included = set(registered)
+        included.update(self.involved_branches())
+        included.update(
+            worktree.branch
+            for worktree in self.repo.managed_worktrees
+            if worktree.branch in pull_requests
+        )
+        if not included:
+            return {}
+        changed = True
+        while changed:
+            changed = False
+            for branch in list(included):
+                pull_request = pull_requests.get(branch)
+                if (
+                    pull_request is not None
+                    and pull_request.base in pull_requests
+                    and pull_request.base not in included
+                ):
+                    included.add(pull_request.base)
+                    changed = True
+            for branch, pull_request in pull_requests.items():
+                if pull_request.base in included and branch not in included:
+                    included.add(branch)
+                    changed = True
+        registered_pull_requests = {
+            branch: pull_request
+            for branch, pull_request in pull_requests.items()
+            if branch in included
+        }
+        for branch, pull_request in registered_pull_requests.items():
+            if (
+                self.repo.local_parent(branch) != pull_request.base
+                or branch not in self.repo.registered_branches()
+            ):
+                self.repo.set_local_parent(branch, pull_request.base)
+                self.repo.set_registered(branch, True)
+        return registered_pull_requests
+
+    def register(self, branch: str, parent: str) -> PullRequest:
+        existing = self.pull_requests(force=True).get(branch)
+        if existing is not None:
+            self.repo.set_registered(branch, True)
+            self.repo.set_local_parent(branch, existing.base)
+            return existing
+        self.repo.git(["push", "--set-upstream", "origin", branch])
+        title = self.repo.git(["log", "-1", "--format=%s", branch]).stdout.strip() or branch
+        result = self.repo.runner.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--draft",
+                "--head",
+                branch,
+                "--base",
+                parent,
+                "--title",
+                title,
+                "--body",
+                "Registered by tmux-worktrees.",
+            ],
+            cwd=self.repo.root,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to create draft PR")
+        pull_request = self.pull_requests(force=True).get(branch)
+        if pull_request is None:
+            raise RuntimeError("draft PR was created but could not be rediscovered")
+        self.repo.set_registered(branch, True)
+        self.repo.set_local_parent(branch, pull_request.base)
+        return pull_request
+
+    def reparent(self, pull_request: PullRequest, parent: str) -> None:
+        result = self.repo.runner.run(
+            ["gh", "pr", "edit", str(pull_request.number), "--base", parent],
+            cwd=self.repo.root,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to update PR base")
+        self._pull_requests = None
+        self._involved_branches = None
+        self.repo.set_local_parent(pull_request.head, parent)
 
 
 @dataclass
@@ -90,184 +265,6 @@ class Hierarchy:
         return depth
 
 
-@dataclass(frozen=True)
-class GraphiteParent:
-    tracked: bool
-    parent: str | None = None
-    error: str | None = None
-
-
-class GraphiteProvider:
-    def __init__(self, common_dir: Path, runner: Runner):
-        self.common_dir = common_dir
-        self.runner = runner
-        self._cache: dict[str, GraphiteParent] = {}
-        self.configured = (common_dir / ".graphite_repo_config").exists()
-        self._database_invalid: dict[str, str] = {}
-        self._database_parents = self._read_database()
-
-    def trunks(self) -> list[str]:
-        config_path = self.common_dir / ".graphite_repo_config"
-        if not config_path.exists():
-            return []
-        try:
-            data = json.loads(config_path.read_text())
-        except (OSError, ValueError):
-            return []
-        trunks = [item.get("name") for item in data.get("trunks", [])]
-        trunks = [name for name in trunks if isinstance(name, str)]
-        if not trunks and isinstance(data.get("trunk"), str):
-            trunks.append(data["trunk"])
-        return trunks
-
-    def checked_descendants(self, branch: str, worktrees: list[Worktree]) -> list[Worktree] | None:
-        if self._database_parents is None:
-            return None
-        descendants: set[str] = set()
-        pending = [branch]
-        while pending:
-            parent = pending.pop()
-            children = [
-                child
-                for child, child_parent in self._database_parents.items()
-                if child_parent == parent and child not in descendants
-            ]
-            descendants.update(children)
-            pending.extend(children)
-        return [item for item in worktrees if item.branch in descendants]
-
-    def tracked_parents(self) -> dict[str, str | None]:
-        if self._database_parents is not None:
-            return {
-                branch: parent
-                for branch, parent in self._database_parents.items()
-                if self.common_dir.parent.joinpath(".git").exists()
-                and self.runner.run(
-                    [
-                        "git",
-                        "-C",
-                        str(self.common_dir.parent),
-                        "show-ref",
-                        "--verify",
-                        "--quiet",
-                        f"refs/heads/{branch}",
-                    ],
-                    check=False,
-                ).returncode
-                == 0
-            }
-        if not self.configured:
-            return {}
-        result = self.runner.run(
-            ["gt", "log", "short", "--classic", "--all", "--no-interactive"],
-            cwd=self.common_dir.parent,
-            check=False,
-        )
-        if result.returncode != 0:
-            return {}
-        branches = set(re.findall(r"\$\s+(\S+)", _clean_output(result.stdout)))
-        parents: dict[str, str | None] = {}
-        for branch in branches:
-            info = self.parent(branch)
-            if info.tracked:
-                parents[branch] = info.parent
-        return parents
-
-    def require_supported_version(self) -> None:
-        result = self.runner.run(["gt", "--version"], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(_command_detail(result.stdout, result.stderr))
-        match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout + result.stderr)
-        if not match or tuple(int(part) for part in match.groups()) < (1, 8, 4):
-            raise RuntimeError("Graphite 1.8.4 or newer is required for worktree-safe mutations")
-
-    def validate_tracked_parent(self, branch: str, path: Path) -> str | None:
-        self.require_supported_version()
-        result = self.runner.run(
-            ["gt", "parent", "--cwd", str(path), "--no-interactive"], check=False
-        )
-        if result.returncode != 0:
-            raise RuntimeError(_command_detail(result.stdout, result.stderr))
-        return _first_nonempty_line(result.stdout)
-
-    def parent(self, branch: str, worktree_path: Path | None = None) -> GraphiteParent:
-        if branch in self._cache:
-            return self._cache[branch]
-        if not self.configured:
-            result = GraphiteParent(False)
-            self._cache[branch] = result
-            return result
-
-        if self._database_parents is not None:
-            if branch in self._database_parents:
-                result = GraphiteParent(True, self._database_parents[branch])
-            elif branch in self._database_invalid:
-                result = GraphiteParent(
-                    False,
-                    error=f"Graphite metadata is invalid: {self._database_invalid[branch]}",
-                )
-            else:
-                result = GraphiteParent(False)
-            self._cache[branch] = result
-            return result
-
-        if worktree_path is not None and worktree_path.exists():
-            command = ["gt", "parent", "--cwd", str(worktree_path), "--no-interactive"]
-            result = self.runner.run(command, check=False)
-            if result.returncode == 0:
-                parent = _first_nonempty_line(result.stdout)
-                value = GraphiteParent(True, parent)
-            elif _is_untracked_graphite_error(result.stdout + result.stderr):
-                value = GraphiteParent(False)
-            else:
-                value = GraphiteParent(False, error=_command_detail(result.stdout, result.stderr))
-        else:
-            command = ["gt", "info", branch, "--no-interactive"]
-            result = self.runner.run(command, cwd=self.common_dir.parent, check=False)
-            if result.returncode == 0:
-                parent = None
-                for line in _clean_output(result.stdout).splitlines():
-                    if line.startswith("Parent:"):
-                        parent = line.partition(":")[2].strip() or None
-                        break
-                value = GraphiteParent(True, parent)
-            elif _is_untracked_graphite_error(result.stdout + result.stderr):
-                value = GraphiteParent(False)
-            else:
-                value = GraphiteParent(False, error=_command_detail(result.stdout, result.stderr))
-
-        self._cache[branch] = value
-        return value
-
-    def _read_database(self) -> dict[str, str | None] | None:
-        database_path = self.common_dir / ".graphite_metadata.db"
-        if not self.configured or not database_path.exists():
-            return None
-        try:
-            connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
-            try:
-                columns = {
-                    row[1]
-                    for row in connection.execute("PRAGMA table_info(branch_metadata)")
-                }
-                if not {"branch_name", "parent_branch_name", "validation_result"}.issubset(columns):
-                    return None
-                rows = connection.execute(
-                    "SELECT branch_name, parent_branch_name, validation_result FROM branch_metadata"
-                )
-                parents: dict[str, str | None] = {}
-                for branch, parent, validation in rows:
-                    if validation in {"VALID", "TRUNK"}:
-                        parents[branch] = parent
-                    elif parent is not None:
-                        self._database_invalid[branch] = validation or "unknown state"
-                return parents
-            finally:
-                connection.close()
-        except sqlite3.Error:
-            return None
-
-
 class Repository:
     def __init__(
         self,
@@ -287,7 +284,6 @@ class Repository:
             configured_directory = root / configured_directory
         self.worktrees_dir = _canonical_path(configured_directory)
         self._validate_managed_directory()
-        self.graphite = GraphiteProvider(common_dir, self.runner)
         self._parent_cache: dict[str, ParentInfo] = {}
 
         root_worktree = next((item for item in worktrees if item.path == root), None)
@@ -302,6 +298,7 @@ class Repository:
             if _is_relative_to(worktree.path, self.worktrees_dir):
                 _validate_protocol_path(worktree.path)
                 self.managed_worktrees.append(worktree)
+        self.github = GitHubProvider(self)
 
     @classmethod
     def discover(cls, cwd: str | Path, runner: Runner | None = None) -> Repository:
@@ -359,6 +356,30 @@ class Repository:
             == 0
         )
 
+    def ensure_local_branch(self, branch: str, *, pull_request: int | None = None) -> None:
+        if self.branch_exists(branch):
+            return
+        if pull_request is not None:
+            remote_ref = f"refs/remotes/origin/tmux-worktrees-pr/{pull_request}"
+            self.git(
+                [
+                    "fetch",
+                    "origin",
+                    f"+refs/pull/{pull_request}/head:{remote_ref}",
+                ]
+            )
+            self.git(["branch", branch, remote_ref])
+            return
+        remote_ref = f"refs/remotes/origin/{branch}"
+        self.git(
+            [
+                "fetch",
+                "origin",
+                f"+refs/heads/{branch}:{remote_ref}",
+            ]
+        )
+        self.git(["branch", "--track", branch, f"origin/{branch}"])
+
     def branch_tip(self, branch: str) -> str:
         result = self.git(["rev-parse", "--verify", f"refs/heads/{branch}"])
         return result.stdout.strip()
@@ -414,18 +435,95 @@ class Repository:
             raise RuntimeError(f"failed to create worktree generation token: {error}") from error
 
     def local_parent(self, branch: str) -> str | None:
-        return self.config_value(f"branch.{branch}.tmux-worktrees-parent")
+        result = self.git(
+            ["config", "--local", "--null", "--get", f"branch.{branch}.tmux-worktrees-parent"],
+            check=False,
+        )
+        return result.stdout.removesuffix("\0") if result.returncode == 0 else None
 
     def set_local_parent(self, branch: str, parent: str) -> None:
-        self.set_config(f"branch.{branch}.tmux-worktrees-parent", parent)
+        self.git(["config", "--local", f"branch.{branch}.tmux-worktrees-parent", parent])
         self._parent_cache.pop(branch, None)
 
     def unset_local_parent(self, branch: str) -> None:
         self.git(
-            ["config", "--unset", f"branch.{branch}.tmux-worktrees-parent"],
+            ["config", "--local", "--unset", f"branch.{branch}.tmux-worktrees-parent"],
             check=False,
         )
         self._parent_cache.pop(branch, None)
+
+    def registered_branches(self) -> set[str]:
+        result = self.git(
+            ["config", "--local", "--get-regexp", r"^branch\..*\.tmux-worktrees-registered$"],
+            check=False,
+        )
+        registered: set[str] = set()
+        prefix = "branch."
+        suffix = ".tmux-worktrees-registered"
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition(" ")
+            if (
+                separator
+                and value.strip().lower() == "true"
+                and key.startswith(prefix)
+                and key.endswith(suffix)
+            ):
+                registered.add(key[len(prefix) : -len(suffix)])
+        return registered
+
+    def set_registered(self, branch: str, registered: bool) -> None:
+        key = f"branch.{branch}.tmux-worktrees-registered"
+        if registered:
+            self.git(["config", "--local", key, "true"])
+        else:
+            self.git(["config", "--local", "--unset", key], check=False)
+        self._parent_cache.pop(branch, None)
+
+    def register_local(self, branch: str, parent: str) -> None:
+        if branch == self.trunk_branch:
+            raise RuntimeError("the trunk branch is already registered")
+        if branch == parent:
+            raise RuntimeError("a branch cannot be its own parent")
+        if not self.branch_exists(branch):
+            raise RuntimeError(f"branch does not exist locally: {branch}")
+        if not self.branch_exists(parent) and parent not in self.github.pull_requests():
+            raise RuntimeError(f"parent branch does not exist: {parent}")
+
+        visited: set[str] = set()
+        current = parent
+        pull_requests = self.github.pull_requests()
+        while current and current not in visited:
+            if current == branch:
+                raise RuntimeError("branch registration would create a parent cycle")
+            visited.add(current)
+            pull_request = pull_requests.get(current)
+            current = (
+                pull_request.base
+                if pull_request is not None
+                else self.local_parent(current) or ""
+            )
+
+        previous_parent = self.local_parent(branch)
+        was_registered = branch in self.registered_branches()
+        try:
+            self.set_local_parent(branch, parent)
+            self.set_registered(branch, True)
+        except (CommandError, RuntimeError):
+            if previous_parent is None:
+                self.unset_local_parent(branch)
+            else:
+                self.set_local_parent(branch, previous_parent)
+            if not was_registered:
+                self.set_registered(branch, False)
+            raise
+
+    def unregister(self, branch: str) -> None:
+        self.set_registered(branch, False)
+        self.unset_local_parent(branch)
+
+    @property
+    def trunk_branch(self) -> str | None:
+        return self.config_value("tmux-worktrees.trunk", self.root_worktree.branch)
 
     def direct_parent(self, worktree: Worktree) -> ParentInfo:
         if worktree.is_root:
@@ -435,20 +533,18 @@ class Repository:
         if worktree.branch in self._parent_cache:
             return self._parent_cache[worktree.branch]
 
-        graphite = self.graphite.parent(worktree.branch, worktree.path)
-        if graphite.tracked:
-            info = ParentInfo(graphite.parent, ParentSource.GRAPHITE)
+        registered_pull_request = self.github.registered_pull_requests().get(worktree.branch)
+        local = self.local_parent(worktree.branch)
+        if registered_pull_request is not None:
+            info = ParentInfo(registered_pull_request.base, ParentSource.GITHUB)
+        elif local and worktree.branch in self.registered_branches():
+            info = ParentInfo(local, ParentSource.LOCAL)
         else:
-            local = self.local_parent(worktree.branch)
-            if graphite.error:
-                parent = local or self.infer_parent(worktree.branch)
-                info = ParentInfo(parent, ParentSource.UNRESOLVED, graphite.error)
-            elif local:
-                info = ParentInfo(local, ParentSource.LOCAL, graphite.error)
-            else:
-                inferred = self.infer_parent(worktree.branch)
-                warning = graphite.error
-                info = ParentInfo(inferred, ParentSource.INFERRED, warning)
+            info = ParentInfo(
+                self.trunk_branch,
+                ParentSource.UNREGISTERED,
+                "branch is not registered; use ctrl-g to create or import a draft PR",
+            )
         self._parent_cache[worktree.branch] = info
         return info
 
@@ -458,59 +554,32 @@ class Repository:
         if branch in self._parent_cache:
             return self._parent_cache[branch]
 
-        graphite = self.graphite.parent(branch)
-        if graphite.tracked:
-            info = ParentInfo(graphite.parent, ParentSource.GRAPHITE)
+        registered_pull_request = self.github.registered_pull_requests().get(branch)
+        local = self.local_parent(branch)
+        if registered_pull_request is not None:
+            info = ParentInfo(registered_pull_request.base, ParentSource.GITHUB)
+        elif local and branch in self.registered_branches():
+            info = ParentInfo(local, ParentSource.LOCAL)
         else:
-            local = self.local_parent(branch)
-            if graphite.error:
-                info = ParentInfo(local, ParentSource.UNRESOLVED, graphite.error)
-            elif local:
-                info = ParentInfo(local, ParentSource.LOCAL, graphite.error)
-            else:
-                inferred = self.infer_parent(branch, allow_equal=True)
-                info = ParentInfo(inferred, ParentSource.INFERRED)
+            info = ParentInfo(
+                self.trunk_branch,
+                ParentSource.UNREGISTERED,
+                "branch is not registered; use ctrl-g to create or import a draft PR",
+            )
         self._parent_cache[branch] = info
         return info
 
-    def infer_parent(
-        self,
-        branch: str,
-        *,
-        allow_equal: bool = False,
-        include_external: bool = False,
-        exclude_branches: set[str] | None = None,
-    ) -> str | None:
-        candidates_by_head: dict[str, list[str]] = {}
-        excluded = exclude_branches or set()
-        target = self.worktree_for_branch(branch)
-        target_head = target.head if target else None
-        candidates = self.all_worktrees if include_external else self.managed_worktrees
-        for worktree in candidates:
-            candidate = worktree.branch
-            if (
-                not candidate
-                or candidate == branch
-                or candidate in excluded
-                or not worktree.head
-            ):
-                continue
-            if not allow_equal and target_head and worktree.head == target_head:
-                continue
-            candidates_by_head.setdefault(worktree.head, []).append(candidate)
-
-        history = self.git(["rev-list", "--topo-order", branch], check=False)
-        if history.returncode == 0:
-            for commit in history.stdout.splitlines():
-                candidates = candidates_by_head.get(commit)
-                if not candidates:
-                    continue
-                if len(candidates) == 1:
-                    return candidates[0]
-                if self.root_worktree.branch in candidates:
-                    return self.root_worktree.branch
-                return None
-        return self.root_worktree.branch
+    def local_branch_tips(self) -> dict[str, str]:
+        result = self.git(
+            ["for-each-ref", "--format=%(refname:short)%00%(objectname)", "refs/heads"],
+            check=False,
+        )
+        tips: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            branch, separator, head = line.partition("\0")
+            if separator and branch and head:
+                tips[branch] = head
+        return tips
 
     def hierarchy(self) -> Hierarchy:
         nodes: dict[str, HierarchyNode] = {}
@@ -553,8 +622,6 @@ class Repository:
                 virtual = self.parent_for_virtual_branch(parent_branch)
                 if virtual.warning:
                     node.warnings.append(virtual.warning)
-                if virtual.source == ParentSource.UNRESOLVED:
-                    node.warnings.append(f"parent branch {parent_branch} could not be resolved")
                 parent_branch = virtual.parent
 
             if node.parent_id is None:
@@ -794,7 +861,7 @@ class Repository:
                 and self.local_parent(worktree.branch) == preserve_parent
             ):
                 self.git(
-                    ["config", "--unset", f"branch.{worktree.branch}.tmux-worktrees-parent"],
+                    ["config", "--local", "--unset", f"branch.{worktree.branch}.tmux-worktrees-parent"],
                     check=False,
                 )
             raise
@@ -823,11 +890,11 @@ class Repository:
                 except (CommandError, RuntimeError):
                     pass
             raise
-        self.git(["config", "--remove-section", f"branch.{branch}"], check=False)
+        self.git(["config", "--local", "--remove-section", f"branch.{branch}"], check=False)
 
     def local_children(self, parent: str) -> list[str]:
         result = self.git(
-            ["config", "--get-regexp", r"^branch\..*\.tmux-worktrees-parent$"],
+            ["config", "--local", "--get-regexp", r"^branch\..*\.tmux-worktrees-parent$"],
             check=False,
         )
         children: list[str] = []
@@ -843,7 +910,7 @@ class Repository:
 
     def local_parents(self) -> dict[str, str]:
         result = self.git(
-            ["config", "--get-regexp", r"^branch\..*\.tmux-worktrees-parent$"],
+            ["config", "--local", "--get-regexp", r"^branch\..*\.tmux-worktrees-parent$"],
             check=False,
         )
         parents: dict[str, str] = {}
@@ -856,15 +923,6 @@ class Repository:
             branch = key[len(prefix) : -len(suffix)]
             if branch and value and self.branch_exists(branch):
                 parents[branch] = value.strip()
-        root_branch = self.root_worktree.branch
-        for parent in list(parents.values()):
-            if (
-                parent
-                and parent != root_branch
-                and parent not in parents
-                and self.branch_exists(parent)
-            ):
-                parents[parent] = root_branch or ""
         return parents
 
     def _validate_managed_directory(self) -> None:
@@ -977,23 +1035,3 @@ def _escape_gitignore_pattern(value: str) -> str:
     if escaped.startswith(("#", "!")):
         escaped = "\\" + escaped
     return escaped + "\\ " * trailing_spaces
-
-
-def _clean_output(value: str) -> str:
-    return ANSI_ESCAPE.sub("", value)
-
-
-def _first_nonempty_line(value: str) -> str | None:
-    for line in _clean_output(value).splitlines():
-        if line.strip():
-            return line.strip()
-    return None
-
-
-def _is_untracked_graphite_error(value: str) -> bool:
-    return "untracked branch" in _clean_output(value).lower()
-
-
-def _command_detail(stdout: str, stderr: str) -> str:
-    detail = _clean_output(stderr).strip() or _clean_output(stdout).strip()
-    return detail.splitlines()[0] if detail else "Graphite command failed"
